@@ -9,7 +9,7 @@
 
 ## Resolved Issue
 
-- `GeometryData.create_dae()` previously failed because `input_list` was used before assignment in `src/dk64_lib/data_types/geometry.py`.
+- `StageModelData.create_dae()` previously failed because `input_list` was used before assignment in `src/dk64_lib/data_types/geometry.py`.
 - DAE export is now covered by a regression test and fixed in `7dc9000`.
 
 ## Refactor Sequence

@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import base64
 import binascii
 import json
 import math
@@ -5,15 +8,25 @@ import pathlib
 import struct
 import zlib
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Mapping, Sequence
 
-from collada import Collada
-from collada import geometry as collada_geometry
-from collada import material as collada_material
-from collada import scene, source
-from collada.common import E, tag
+try:
+    from collada import Collada
+    from collada import geometry as collada_geometry
+    from collada import material as collada_material
+    from collada import scene, source
+    from collada.common import E, tag
+except ImportError:
+    Collada = collada_geometry = collada_material = scene = source = E = tag = None
 from dk64_lib.f3dex2 import commands
+from dk64_lib.f3dex2.display_list import (
+    _MeshGroup,
+    ModelBone,
+    _TextureKey,
+    _TextureState,
+    _signed_16,
+)
 from dk64_lib.f3dex2.triangle import Triangle
 from dk64_lib.f3dex2.vertex import Vertex
 from numpy import array as numpy_array
@@ -55,9 +68,6 @@ class TexturedDaeExport:
 @dataclass(frozen=True, slots=True)
 class TexturedGltfExport:
     gltf_data: str
-    binary_filename: str
-    binary_data: bytes
-    images: tuple[TextureImageFile, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,52 +76,11 @@ class TexturedGlbExport:
 
 
 @dataclass(frozen=True, slots=True)
-class _ImageSource:
-    index: int
-    fmt: int
-    size: int
-
-
-@dataclass(frozen=True, slots=True)
-class _TileDescriptor:
-    fmt: int
-    size: int
-    line: int
-    tmem: int
-    palette: int
-    clamp_s: bool
-    clamp_t: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _TextureKey:
-    image_index: int
-    palette_index: int | None
-    fmt: int
-    size: int
+class DecodedTexture:
+    name: str
     width: int
     height: int
-    clamp_s: bool = False
-    clamp_t: bool = False
-
-    @property
-    def material_name(self) -> str:
-        palette = "none" if self.palette_index is None else str(self.palette_index)
-        name = (
-            f"tex_{self.image_index}_pal_{palette}_"
-            f"f{self.fmt}_s{self.size}_{self.width}x{self.height}"
-        )
-        if self.clamp_s and self.clamp_t:
-            return f"{name}_clamp_st"
-        if self.clamp_s:
-            return f"{name}_clamp_s"
-        if self.clamp_t:
-            return f"{name}_clamp_t"
-        return name
-
-    @property
-    def image_filename(self) -> str:
-        return f"{self.material_name}.png"
+    rgba: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,163 +116,111 @@ class _TextureAnimationPlan:
 
 
 @dataclass(frozen=True, slots=True)
-class _MeshGroup:
-    vertices: tuple[Vertex, ...]
-    triangles: tuple[Triangle, ...]
-    texture: _TextureKey | None
-    display_list_offset: int
-
-
-@dataclass(frozen=True, slots=True)
-class _GltfMaterialKey:
+class _MaterialKey:
     texture: _TextureKey | None
     blended: bool
+    lit: bool = False
+    masked: bool = False
+    double_sided: bool = True
+    texture_alpha: bool = False
+    texture_alpha_ignored: bool = False
+
+    @property
+    def name(self) -> str:
+        if self.texture is None:
+            name = "vertex-material-blend" if self.blended else "vertex-material"
+        else:
+            name = self.texture.material_name
+            if self.blended and not self.texture_alpha:
+                name = f"{name}_vertex_alpha"
+            elif self.texture_alpha_ignored:
+                name = f"{name}_solid"
+        if self.lit:
+            name = f"{name}-lit"
+        if not self.double_sided:
+            name = f"{name}-culled"
+        return name
 
 
 TextureAnimationFrameRef = int | tuple[int, int | None]
 TextureAnimationFrames = Mapping[int, Sequence[TextureAnimationFrameRef]]
 
 
-class _TextureState:
-    def __init__(self):
-        self._pending_image: _ImageSource | None = None
-        self._loaded_images: dict[int, _ImageSource] = {}
-        self._tile_descriptors: dict[int, _TileDescriptor] = {}
-        self._tile_sizes: dict[int, tuple[int, int]] = {}
-        self._last_loaded_tile: int | None = None
-        self._last_palette: _ImageSource | None = None
-        self._active_tile: int | None = None
-
-    def clone(self) -> "_TextureState":
-        state = _TextureState()
-        state._pending_image = self._pending_image
-        state._loaded_images = dict(self._loaded_images)
-        state._tile_descriptors = dict(self._tile_descriptors)
-        state._tile_sizes = dict(self._tile_sizes)
-        state._last_loaded_tile = self._last_loaded_tile
-        state._last_palette = self._last_palette
-        state._active_tile = self._active_tile
-        return state
-
-    def apply(self, command: commands.DL_Command) -> None:
-        if isinstance(command, commands.G_SETTIMG):
-            self._pending_image = _ImageSource(
-                index=command.address,
-                fmt=command.fmt,
-                size=command.size,
-            )
-            return
-
-        if isinstance(command, (commands.G_LOADBLOCK, commands.G_LOADTILE)):
-            if self._pending_image is not None:
-                self._loaded_images[command.tile] = self._pending_image
-                self._last_loaded_tile = command.tile
-            return
-
-        if isinstance(command, commands.G_LOADTLUT):
-            if self._pending_image is not None:
-                self._last_palette = self._pending_image
-            return
-
-        if isinstance(command, commands.G_SETTILE):
-            self._tile_descriptors[command.tile] = _TileDescriptor(
-                fmt=command.fmt,
-                size=command.size,
-                line=command.line,
-                tmem=command.tmem,
-                palette=command.palette,
-                clamp_s=bool(command.cm_s & 0x2),
-                clamp_t=bool(command.cm_t & 0x2),
-            )
-            return
-
-        if isinstance(command, commands.G_SETTILESIZE):
-            if self._active_tile is None:
-                self._active_tile = command.tile
-            self._tile_sizes[command.tile] = _tile_dimensions(command)
-            return
-
-        if isinstance(command, commands.G_TEXTURE):
-            self._active_tile = command.tile if command.on else None
-
-    @property
-    def active_texture(self) -> _TextureKey | None:
-        if self._active_tile is None:
-            return None
-
-        descriptor = self._tile_descriptors.get(self._active_tile)
-        dimensions = self._tile_sizes.get(self._active_tile)
-        if descriptor is None or dimensions is None:
-            return None
-
-        source = self._loaded_images.get(self._active_tile)
-        if source is None and self._last_loaded_tile is not None:
-            source = self._loaded_images.get(self._last_loaded_tile)
-        if source is None:
-            return None
-
-        palette_index = None
-        if descriptor.fmt == 2 and self._last_palette is not None:
-            palette_index = self._last_palette.index
-
-        return _TextureKey(
-            image_index=source.index,
-            palette_index=palette_index,
-            fmt=descriptor.fmt,
-            size=descriptor.size,
-            width=dimensions[0],
-            height=dimensions[1],
-            clamp_s=descriptor.clamp_s,
-            clamp_t=descriptor.clamp_t,
-        )
-
-
 class TexturedObjExporter:
-    def __init__(self, texture_data: Iterable[object]):
+    def __init__(
+        self,
+        texture_data: Iterable[object],
+        fallback_texture_data: Iterable[object] = tuple(),
+    ):
         self._texture_data = tuple(texture_data)
+        self._fallback_texture_data = tuple(fallback_texture_data)
 
     def export(
         self,
-        display_lists: Iterable[object],
+        mesh_groups: Iterable[_MeshGroup],
         mtl_filename: str,
         texture_folder: str = "textures",
+        include_textures: bool = True,
     ) -> TexturedObjExport:
-        groups = tuple(self._iter_mesh_groups(display_lists))
-        texture_plans = self._texture_plans_for_groups(groups)
+        groups, texture_plans = self._groups_and_texture_plans(mesh_groups, include_textures)
         images = self._texture_images_for_plans(texture_plans, texture_folder)
-        transparent_textures = tuple(
-            texture_plan.texture
-            for texture_plan in texture_plans
-            if _texture_level_has_transparency(texture_plan.levels[0])
-        )
+        material_names, materials = _materials_by_group(groups, texture_plans)
         return TexturedObjExport(
-            obj_data=self._obj_data(groups, mtl_filename),
-            mtl_data=self._mtl_data(texture_plans, texture_folder),
+            obj_data=self._obj_data(groups, material_names, mtl_filename),
+            mtl_data=self._mtl_data(materials, texture_folder),
             images=images,
             support_files=_blender_material_setup_support_files(
                 mtl_filename,
-                transparent_textures,
+                materials,
             ),
         )
 
+    def decode(
+        self,
+        mesh_groups: Iterable[_MeshGroup],
+    ) -> tuple[tuple[_MeshGroup, ...], tuple[DecodedTexture, ...]]:
+        groups, texture_plans = self._groups_and_texture_plans(mesh_groups, True)
+        textures = tuple(
+            DecodedTexture(
+                name=texture_plan.texture.material_name,
+                width=texture_plan.levels[0].width,
+                height=texture_plan.levels[0].height,
+                rgba=texture_plan.levels[0].rgba,
+            )
+            for texture_plan in texture_plans
+        )
+        return groups, textures
+
     def export_texture_images(
         self,
-        display_lists: Iterable[object],
+        mesh_groups: Iterable[_MeshGroup],
         texture_folder: str = "textures",
     ) -> tuple[TextureImageFile, ...]:
         """Export PNG files for textures identified by F3DEX2 display lists."""
-        groups = tuple(self._iter_mesh_groups(display_lists))
+        groups = tuple(mesh_groups)
         texture_plans = self._texture_plans_for_groups(groups)
         return self._texture_images_for_plans(texture_plans, texture_folder)
 
-    def texture_image_indices(self, display_lists: Iterable[object]) -> tuple[int, ...]:
+    def texture_image_indices(self, mesh_groups: Iterable[_MeshGroup]) -> tuple[int, ...]:
         """Return texture image table indices identified by F3DEX2 display lists."""
-        groups = tuple(self._iter_mesh_groups(display_lists))
+        groups = tuple(mesh_groups)
         return tuple(
             texture.image_index
             for texture in dict.fromkeys(group.texture for group in groups)
             if texture
         )
+
+    def _groups_and_texture_plans(
+        self,
+        mesh_groups: Iterable[_MeshGroup],
+        include_textures: bool,
+    ) -> tuple[tuple[_MeshGroup, ...], tuple[_TextureExportPlan, ...]]:
+        groups = tuple(mesh_groups)
+        if not include_textures:
+            return tuple(replace(group, texture=None) for group in groups), tuple()
+
+        groups = _drop_untextured_duplicate_triangles(groups)
+        return groups, self._texture_plans_for_groups(groups)
 
     def _texture_plans_for_groups(
         self,
@@ -330,120 +247,52 @@ class TexturedObjExporter:
             for image in self._texture_images(texture_plan, texture_folder)
         )
 
-    def _iter_mesh_groups(
+    def _obj_data(
         self,
-        display_lists: Iterable[object],
-    ) -> Iterable[_MeshGroup]:
-        for display_list in display_lists:
-            if display_list.is_branched:
-                continue
-            yield from self._iter_display_list_groups(display_list, _TextureState())
-
-    def _iter_display_list_groups(
-        self,
-        display_list: object,
-        state: _TextureState,
-    ) -> Iterable[_MeshGroup]:
-        vertices: tuple[Vertex, ...] = tuple()
-        triangles: list[Triangle] = []
-        current_texture: _TextureKey | None = None
-
-        for command in display_list.commands:
-            if isinstance(command, commands.G_VTX):
-                if vertices and triangles:
-                    yield _MeshGroup(
-                        vertices=vertices,
-                        triangles=tuple(triangles),
-                        texture=current_texture,
-                        display_list_offset=display_list.offset,
-                    )
-                vertices = tuple(_vertices_for_command(display_list, command))
-                triangles = []
-                current_texture = state.active_texture
-                continue
-
-            if isinstance(command, commands.G_TRI1):
-                active_texture = state.active_texture
-                if triangles and active_texture != current_texture:
-                    yield _MeshGroup(
-                        vertices=vertices,
-                        triangles=tuple(triangles),
-                        texture=current_texture,
-                        display_list_offset=display_list.offset,
-                    )
-                    triangles = []
-                current_texture = active_texture
-                triangles.append(Triangle.from_tri1(command))
-                continue
-
-            if isinstance(command, commands.G_TRI2):
-                active_texture = state.active_texture
-                if triangles and active_texture != current_texture:
-                    yield _MeshGroup(
-                        vertices=vertices,
-                        triangles=tuple(triangles),
-                        texture=current_texture,
-                        display_list_offset=display_list.offset,
-                    )
-                    triangles = []
-                current_texture = active_texture
-                tri1, tri2 = Triangle.from_tri2(command)
-                triangles.extend((tri1, tri2))
-                continue
-
-            if isinstance(command, commands.G_DL):
-                branch = display_list.get_branch_by_offset(
-                    int.from_bytes(command.address, "big")
-                )
-                if branch is not None:
-                    yield from self._iter_display_list_groups(branch, state.clone())
-                continue
-
-            state.apply(command)
-
-        if vertices and triangles:
-            yield _MeshGroup(
-                vertices=vertices,
-                triangles=tuple(triangles),
-                texture=current_texture,
-                display_list_offset=display_list.offset,
-            )
-
-    def _obj_data(self, groups: tuple[_MeshGroup, ...], mtl_filename: str) -> str:
+        groups: tuple[_MeshGroup, ...],
+        material_names: tuple[str, ...],
+        mtl_filename: str,
+    ) -> str:
         lines = [f"mtllib {mtl_filename}", ""]
         vertex_offset = 1
         texture_offset = 1
+        normal_offset = 1
 
         for group_num, group in enumerate(groups, 1):
             lines.append(
                 f"# Mesh Group {group_num}, "
                 f"Display List Offset: {group.display_list_offset}"
             )
+            lines.append(f"o mesh_group_{group_num - 1}")
             for vertex in group.vertices:
                 lines.append(vertex.to_obj_line())
+            for normal in group.vertex_normals:
+                lines.append("vn " + " ".join(f"{axis:.6f}" for axis in normal))
+
+            def corner(index: int) -> str:
+                parts = [str(index + vertex_offset)]
+                if group.texture is not None:
+                    parts.append(str(index + texture_offset))
+                if group.vertex_normals:
+                    parts = parts + [""] * (2 - len(parts)) + [str(index + normal_offset)]
+                return "/".join(parts)
 
             if group.texture is not None:
                 for vertex in group.vertices:
                     u, v = _uv_for_vertex(vertex, group.texture)
                     lines.append(f"vt {u:.8f} {v:.8f}")
-                lines.append(f"usemtl {group.texture.material_name}")
-                for triangle in group.triangles:
-                    lines.append(
-                        "f "
-                        f"{triangle.v1 + vertex_offset}/{triangle.v1 + texture_offset} "
-                        f"{triangle.v2 + vertex_offset}/{triangle.v2 + texture_offset} "
-                        f"{triangle.v3 + vertex_offset}/{triangle.v3 + texture_offset}"
-                    )
-                texture_offset += len(group.vertices)
-            else:
-                for triangle in group.triangles:
-                    lines.append(
-                        "f "
-                        f"{triangle.v1 + vertex_offset} "
-                        f"{triangle.v2 + vertex_offset} "
-                        f"{triangle.v3 + vertex_offset}"
-                    )
+            lines.append(f"usemtl {material_names[group_num - 1]}")
+            for triangle in group.triangles:
+                lines.append(
+                    "f "
+                    f"{corner(triangle.v1)} "
+                    f"{corner(triangle.v2)} "
+                    f"{corner(triangle.v3)}"
+                )
 
+            if group.texture is not None:
+                texture_offset += len(group.vertices)
+            normal_offset += len(group.vertex_normals)
             vertex_offset += len(group.vertices)
             lines.append("")
 
@@ -451,24 +300,25 @@ class TexturedObjExporter:
 
     def _mtl_data(
         self,
-        texture_plans: tuple[_TextureExportPlan, ...],
+        materials: dict[str, _MaterialKey],
         texture_folder: str,
     ) -> str:
         lines: list[str] = []
-        for texture_plan in texture_plans:
-            texture = texture_plan.texture
-            has_transparency = _texture_level_has_transparency(texture_plan.levels[0])
+        for name, material_key in materials.items():
+            texture = material_key.texture
+            has_transparency = material_key.texture_alpha
             lines.extend(
                 (
-                    f"newmtl {texture.material_name}",
+                    f"newmtl {name}",
                     "Ka 1.000000 1.000000 1.000000",
                     "Kd 1.000000 1.000000 1.000000",
                     "Ks 0.000000 0.000000 0.000000",
                     "d 1.000000",
                     "illum 4" if has_transparency else "illum 1",
-                    _mtl_texture_map_statement("map_Kd", texture, texture_folder),
                 )
             )
+            if texture is not None:
+                lines.append(_mtl_texture_map_statement("map_Kd", texture, texture_folder))
             if has_transparency:
                 lines.append(f"map_d {texture_folder}/{_alpha_mask_filename(texture)}")
             lines.append("")
@@ -527,7 +377,7 @@ class TexturedObjExporter:
         self,
         texture: _TextureKey,
     ) -> tuple[_DecodedTextureLevel, ...]:
-        raw_texture = self._raw_texture(texture.image_index)
+        raw_texture = self._raw_texture(texture.image_index, texture.from_fallback_table)
         raw_palette = (
             self._raw_texture(texture.palette_index)
             if texture.palette_index is not None
@@ -537,6 +387,15 @@ class TexturedObjExporter:
         if mip_levels:
             return mip_levels
 
+        # A file holding more than the texture has mip levels after it, and those files are
+        # stored with TMEM's odd row swap already applied.
+        if raw_texture is not None and texture.byte_size < len(raw_texture) < texture.byte_size * 2:
+            raw_texture = _deswizzle_tmem_rows(
+                raw_texture,
+                texture.width,
+                texture.height,
+                4 << texture.size,
+            )
         rgba = decode_texture(
             raw_texture,
             fmt=texture.fmt,
@@ -547,31 +406,24 @@ class TexturedObjExporter:
         )
         return (_DecodedTextureLevel(None, texture.width, texture.height, rgba),)
 
-    def _raw_texture(self, index: int | None) -> bytes | None:
-        if index is None or index < 0 or index >= len(self._texture_data):
+    def _raw_texture(self, index: int | None, from_fallback: bool = False) -> bytes | None:
+        texture_data = self._fallback_texture_data if from_fallback else self._texture_data
+        if index is None or index < 0 or index >= len(texture_data):
             return None
-        texture = self._texture_data[index]
+        texture = texture_data[index]
         return getattr(texture, "raw_data", None)
 
 
 class TexturedDaeExporter(TexturedObjExporter):
     def export(
         self,
-        display_lists: Iterable[object],
+        mesh_groups: Iterable[_MeshGroup],
         texture_folder: str = "textures",
         animated_texture_frames: TextureAnimationFrames | None = None,
         animation_frame_duration: int = 4,
+        include_textures: bool = True,
     ) -> TexturedDaeExport:
-        groups = tuple(self._iter_mesh_groups(display_lists))
-        textures = tuple(
-            texture
-            for texture in dict.fromkeys(group.texture for group in groups)
-            if texture
-        )
-        texture_plans = tuple(
-            _TextureExportPlan(texture, self._decoded_texture_levels(texture))
-            for texture in textures
-        )
+        groups, texture_plans = self._groups_and_texture_plans(mesh_groups, include_textures)
         animation_plans = tuple(
             animation_plan
             for texture_plan in texture_plans
@@ -693,86 +545,86 @@ class TexturedDaeExporter(TexturedObjExporter):
 class TexturedGltfExporter(TexturedObjExporter):
     def export(
         self,
-        display_lists: Iterable[object],
-        binary_filename: str = "geometry.bin",
-        texture_folder: str = "textures",
+        mesh_groups: Iterable[_MeshGroup],
         include_textures: bool = True,
     ) -> TexturedGltfExport:
-        groups, texture_plans = self._groups_and_texture_plans(
-            display_lists,
-            include_textures,
+        groups, texture_plans = self._groups_and_texture_plans(mesh_groups, include_textures)
+        gltf, binary_data = _gltf_mesh(groups, texture_plans)
+        gltf["buffers"][0]["uri"] = (
+            f"data:application/octet-stream;base64,{base64.b64encode(binary_data).decode('ascii')}"
         )
-        images = tuple(
-            image
-            for texture_plan in texture_plans
-            for image in self._texture_level_images(texture_plan, texture_folder)
-        )
-        gltf, binary_data = _gltf_mesh(
-            groups,
-            texture_plans,
-            binary_filename,
-            texture_folder,
-            embedded_images=tuple(),
-        )
-        return TexturedGltfExport(
-            gltf_data=_gltf_json(gltf),
-            binary_filename=binary_filename,
-            binary_data=binary_data,
-            images=images,
-        )
+        return TexturedGltfExport(gltf_data=_gltf_json(gltf))
 
     def export_glb(
         self,
-        display_lists: Iterable[object],
+        mesh_groups: Iterable[_MeshGroup],
         include_textures: bool = True,
+        skeleton: tuple[ModelBone, ...] = tuple(),
     ) -> TexturedGlbExport:
-        groups, texture_plans = self._groups_and_texture_plans(
-            display_lists,
-            include_textures,
-        )
-        embedded_images = tuple(
-            image
-            for texture_plan in texture_plans
-            for image in self._texture_level_images(texture_plan, "")
-            if "_mip" not in image.filename
-        )
-        gltf, binary_data = _gltf_mesh(
-            groups,
-            texture_plans,
-            binary_filename=None,
-            texture_folder="",
-            embedded_images=embedded_images,
-        )
+        groups, texture_plans = self._groups_and_texture_plans(mesh_groups, include_textures)
+        gltf, binary_data = _gltf_mesh(groups, texture_plans, skeleton)
         return TexturedGlbExport(data=_glb_data(gltf, binary_data))
 
-    def _groups_and_texture_plans(
-        self,
-        display_lists: Iterable[object],
-        include_textures: bool,
-    ) -> tuple[tuple[_MeshGroup, ...], tuple[_TextureExportPlan, ...]]:
-        groups = tuple(self._iter_mesh_groups(display_lists))
-        if not include_textures:
-            return tuple(
-                _MeshGroup(
-                    group.vertices,
-                    group.triangles,
-                    None,
-                    group.display_list_offset,
-                )
-                for group in groups
-            ), tuple()
 
-        groups = _drop_untextured_duplicate_triangles(groups)
-        textures = tuple(
-            texture
-            for texture in dict.fromkeys(group.texture for group in groups)
-            if texture
+def display_list_mesh_groups(display_lists: Iterable[object]) -> tuple[_MeshGroup, ...]:
+    return tuple(
+        group
+        for display_list in display_lists
+        if not display_list.is_branched
+        for group in _display_list_groups(display_list, _TextureState())
+    )
+
+
+def _display_list_groups(
+    display_list: object,
+    state: _TextureState,
+) -> Iterable[_MeshGroup]:
+    vertices: tuple[Vertex, ...] = tuple()
+    triangles: list[Triangle] = []
+    current_texture: _TextureKey | None = None
+
+    def mesh_group() -> _MeshGroup:
+        return _MeshGroup(
+            vertices=vertices,
+            triangles=tuple(triangles),
+            texture=current_texture,
+            display_list_offset=display_list.offset,
+            render=state.render_state,
         )
-        texture_plans = tuple(
-            _TextureExportPlan(texture, self._decoded_texture_levels(texture))
-            for texture in textures
-        )
-        return groups, texture_plans
+
+    for command in display_list.commands:
+        if isinstance(command, commands.G_VTX):
+            if vertices and triangles:
+                yield mesh_group()
+            vertices = tuple(_vertices_for_command(display_list, command))
+            triangles = []
+            current_texture = state.active_texture
+            continue
+
+        if isinstance(command, (commands.G_TRI1, commands.G_TRI2)):
+            active_texture = state.active_texture
+            if triangles and active_texture != current_texture:
+                yield mesh_group()
+                triangles = []
+            current_texture = active_texture
+            if isinstance(command, commands.G_TRI1):
+                triangles.append(Triangle.from_tri1(command))
+            else:
+                triangles.extend(Triangle.from_tri2(command))
+            continue
+
+        if isinstance(command, commands.G_DL):
+            branch = display_list.get_branch_by_offset(
+                int.from_bytes(command.address, "big")
+            )
+            if branch is not None:
+                yield from _display_list_groups(branch, state.clone())
+            continue
+
+        state.apply(command)
+
+    if vertices and triangles:
+        yield mesh_group()
 
 
 def _drop_untextured_duplicate_triangles(
@@ -799,14 +651,7 @@ def _drop_untextured_duplicate_triangles(
             if _triangle_position_key(group, triangle) not in textured_triangles
         )
         if triangles:
-            filtered_groups.append(
-                _MeshGroup(
-                    vertices=group.vertices,
-                    triangles=triangles,
-                    texture=group.texture,
-                    display_list_offset=group.display_list_offset,
-                )
-            )
+            filtered_groups.append(replace(group, triangles=triangles))
 
     return tuple(filtered_groups)
 
@@ -825,6 +670,47 @@ def _triangle_position_key(
             for vertex_index in (triangle.v1, triangle.v2, triangle.v3)
             if 0 <= vertex_index < len(group.vertices)
         )
+    )
+
+
+def _materials_by_group(
+    groups: tuple[_MeshGroup, ...],
+    texture_plans: tuple[_TextureExportPlan, ...],
+) -> tuple[tuple[str, ...], dict[str, _MaterialKey]]:
+    texture_plans_by_texture = {plan.texture: plan for plan in texture_plans}
+    names = list()
+    materials = dict()
+    for group in groups:
+        key = _material_key(group, texture_plans_by_texture)
+        names.append(key.name)
+        materials.setdefault(key.name, key)
+    return tuple(names), materials
+
+
+def _material_key(
+    group: _MeshGroup,
+    texture_plans_by_texture: dict[_TextureKey, _TextureExportPlan],
+) -> _MaterialKey:
+    cutout = graded = alpha_ignored = False
+    if group.texture is not None:
+        texture_plan = texture_plans_by_texture.get(group.texture)
+        if texture_plan and _texture_level_has_transparency(texture_plan.levels[0]):
+            if group.render is None or group.render.alpha_reads_texture:
+                cutout = _texture_level_alpha_is_binary(texture_plan.levels[0])
+                graded = not cutout
+            else:
+                alpha_ignored = True
+    blended = graded or group.translucent or (
+        not group.vertex_normals and _mesh_group_has_vertex_transparency(group)
+    )
+    return _MaterialKey(
+        group.texture,
+        blended,
+        lit=bool(group.vertex_normals),
+        masked=cutout,
+        double_sided=group.double_sided,
+        texture_alpha=cutout or graded,
+        texture_alpha_ignored=alpha_ignored,
     )
 
 
@@ -941,18 +827,7 @@ def save_textured_gltf_export(
     gltf_path = folder / gltf_filename
     gltf_path.parent.mkdir(parents=True, exist_ok=True)
     gltf_path.write_text(export.gltf_data)
-
-    bin_path = gltf_path.parent / export.binary_filename
-    bin_path.write_bytes(export.binary_data)
-    written_paths = [gltf_path, bin_path]
-
-    for image in export.images:
-        image_path = folder / image.filename
-        image_path.parent.mkdir(parents=True, exist_ok=True)
-        image_path.write_bytes(image.data)
-        written_paths.append(image_path)
-
-    return written_paths
+    return [gltf_path]
 
 
 def save_textured_glb_export(
@@ -990,6 +865,10 @@ def _texture_level_has_transparency(level: _DecodedTextureLevel) -> bool:
     return any(alpha < 255 for alpha in level.rgba[3::4])
 
 
+def _texture_level_alpha_is_binary(level: _DecodedTextureLevel) -> bool:
+    return set(level.rgba[3::4]) <= {0, 0xFF}
+
+
 def _alpha_mask_rgba(source_rgba: bytes) -> bytes:
     mask = bytearray()
     for alpha in source_rgba[3::4]:
@@ -1006,24 +885,63 @@ def _mtl_texture_map_statement(
     return f"{map_name}{options} {texture_folder}/{texture.image_filename}"
 
 
+_BLENDED_SETTINGS = (
+    ("surface_render_method", "BLENDED"),
+    ("blend_method", "BLEND"),
+    ("use_transparency_overlap", False),
+    ("show_transparent_back", False),
+)
+_MASKED_SETTINGS = (
+    ("surface_render_method", "DITHERED"),
+    ("blend_method", "CLIP"),
+    ("alpha_threshold", 0.5),
+)
+_CULLED_SETTINGS = (("use_backface_culling", True),)
+
+
 def _blender_material_setup_support_files(
     mtl_filename: str,
-    transparent_textures: tuple[_TextureKey, ...],
+    materials: dict[str, _MaterialKey],
 ) -> tuple[TexturedObjSupportFile, ...]:
-    if not transparent_textures:
+    settings = {
+        name: settings
+        for name, key in materials.items()
+        if (settings := _blender_material_settings(key))
+    }
+    if not settings:
         return tuple()
     filename = pathlib.Path(mtl_filename).with_suffix(".blender.py").name
-    material_names = tuple(texture.material_name for texture in transparent_textures)
     return (
         TexturedObjSupportFile(
             filename=filename,
-            data=_blender_material_setup_script(material_names),
+            data=_blender_material_setup_script(settings),
         ),
     )
 
 
-def _blender_material_setup_script(material_names: tuple[str, ...]) -> str:
-    material_lines = "\n".join(f"    {material_name!r}," for material_name in material_names)
+def _blender_material_settings(key: _MaterialKey) -> tuple[tuple[str, object], ...]:
+    settings = tuple()
+    if key.blended:
+        settings += _BLENDED_SETTINGS
+    elif key.masked:
+        settings += _MASKED_SETTINGS
+    if not key.double_sided:
+        settings += _CULLED_SETTINGS
+    return settings
+
+
+def _blender_material_setup_script(
+    settings: dict[str, tuple[tuple[str, object], ...]],
+) -> str:
+    material_lines = "\n".join(
+        f"    {name!r}: (\n"
+        + "".join(
+            f"        ({_python_literal(attribute)}, {_python_literal(value)}),\n"
+            for attribute, value in material_settings
+        )
+        + "    ),"
+        for name, material_settings in settings.items()
+    )
     return f"""\
 \"\"\"Apply Blender-specific material settings for a dk64_lib OBJ import.
 
@@ -1034,9 +952,9 @@ materials to Blender's Blended render method, which OBJ/MTL cannot express.
 import bpy
 
 
-TRANSPARENT_MATERIALS = (
+MATERIAL_SETTINGS = {{
 {material_lines}
-)
+}}
 
 
 def _try_set(material, attribute, value):
@@ -1048,19 +966,21 @@ def _try_set(material, attribute, value):
         print(f\"Could not set {{material.name}}.{{attribute}}: {{exc}}\")
 
 
-for material_name in TRANSPARENT_MATERIALS:
+for material_name, settings in MATERIAL_SETTINGS.items():
     material = bpy.data.materials.get(material_name)
     if material is None:
         print(f\"Missing material: {{material_name}}\")
         continue
 
-    _try_set(material, \"surface_render_method\", \"BLENDED\")
-    _try_set(material, \"blend_method\", \"BLEND\")
-    _try_set(material, \"use_transparency_overlap\", False)
-    _try_set(material, \"show_transparent_back\", False)
+    for attribute, value in settings:
+        _try_set(material, attribute, value)
 
-print(f\"Configured {{len(TRANSPARENT_MATERIALS)}} transparent DK64 material(s).\")
+print(f\"Configured {{len(MATERIAL_SETTINGS)}} DK64 material(s).\")
 """
+
+
+def _python_literal(value: object) -> str:
+    return f'"{value}"' if isinstance(value, str) else repr(value)
 
 
 def _animation_frames_for_texture(
@@ -1290,10 +1210,14 @@ def _dae_mesh(
     texture_folder: str,
     animation_plans_by_texture: Mapping[_TextureKey, _TextureAnimationPlan] | None = None,
 ) -> Collada:
+    if Collada is None:
+        raise ImportError("DAE export needs pycollada, which is not installed")
     mesh = Collada()
     animation_plans_by_texture = animation_plans_by_texture or {}
+    material_names, materials = _materials_by_group(groups, texture_plans)
     materials_by_symbol = _dae_materials_by_symbol(
         mesh,
+        materials,
         texture_plans,
         texture_folder,
         animation_plans_by_texture,
@@ -1306,9 +1230,11 @@ def _dae_mesh(
         animation_plan = (
             animation_plans_by_texture.get(group.texture) if group.texture else None
         )
-        geom = _dae_geometry_for_group(mesh, group, group_index, animation_plan)
+        material_symbol = material_names[group_index]
+        geom = _dae_geometry_for_group(
+            mesh, group, group_index, material_symbol, animation_plan
+        )
         mesh.geometries.append(geom)
-        material_symbol = _dae_material_symbol(group.texture)
         material_inputs = [("TEX0", "TEXCOORD", "0")] if group.texture else []
         material_node = scene.MaterialNode(
             material_symbol,
@@ -1326,33 +1252,45 @@ def _dae_mesh(
 
 def _dae_materials_by_symbol(
     mesh: Collada,
+    materials: dict[str, _MaterialKey],
     texture_plans: tuple[_TextureExportPlan, ...],
     texture_folder: str,
     animation_plans_by_texture: Mapping[_TextureKey, _TextureAnimationPlan],
 ) -> dict[str, collada_material.Material]:
-    materials = {"vertex-material": _dae_vertex_material(mesh)}
-    for texture_plan in texture_plans:
-        symbol = texture_plan.texture.material_name
-        materials[symbol] = _dae_texture_material(
+    texture_plans_by_texture = {plan.texture: plan for plan in texture_plans}
+    materials_by_symbol = dict()
+    for name, material_key in materials.items():
+        texture_plan = texture_plans_by_texture.get(material_key.texture)
+        if texture_plan is None:
+            materials_by_symbol[name] = _dae_vertex_material(mesh, name, material_key)
+            continue
+        materials_by_symbol[name] = _dae_texture_material(
             mesh,
+            name,
+            material_key,
             texture_plan,
             texture_folder,
-            animation_plans_by_texture.get(texture_plan.texture),
+            animation_plans_by_texture.get(material_key.texture),
         )
-    return materials
+    return materials_by_symbol
 
 
-def _dae_vertex_material(mesh: Collada) -> collada_material.Material:
+def _dae_vertex_material(
+    mesh: Collada,
+    name: str,
+    material_key: _MaterialKey,
+) -> collada_material.Material:
     effect = collada_material.Effect(
-        "vertex-effect",
+        f"{name}-effect",
         [],
         "phong",
         diffuse=(1.0, 1.0, 1.0, 1.0),
         specular=(0.0, 0.0, 0.0, 1.0),
+        double_sided=material_key.double_sided,
     )
     effect.transparent = None
     effect.transparency = None
-    mat = collada_material.Material("vertex-material", "vertex-material", effect)
+    mat = collada_material.Material(name, name, effect)
     mesh.effects.append(effect)
     mesh.materials.append(mat)
     return mat
@@ -1360,6 +1298,8 @@ def _dae_vertex_material(mesh: Collada) -> collada_material.Material:
 
 def _dae_texture_material(
     mesh: Collada,
+    name: str,
+    material_key: _MaterialKey,
     texture_plan: _TextureExportPlan,
     texture_folder: str,
     animation_plan: _TextureAnimationPlan | None = None,
@@ -1382,17 +1322,20 @@ def _dae_texture_material(
     )
     color_map, params = _dae_texture_map(
         mesh,
-        texture.material_name,
+        name,
         _dae_texture_path(texture_folder, texture_filename),
         texture,
     )
-    has_transparency = _texture_level_has_transparency(transparency_level)
+    has_transparency = (
+        _texture_level_has_transparency(transparency_level)
+        and not material_key.texture_alpha_ignored
+    )
     transparent = None
     transparency = None
     if has_transparency:
         alpha_map, alpha_params = _dae_texture_map(
             mesh,
-            f"{texture.material_name}-alpha",
+            f"{name}-alpha",
             _dae_texture_path(texture_folder, alpha_filename),
             texture,
         )
@@ -1401,24 +1344,21 @@ def _dae_texture_material(
         transparency = 1.0
 
     effect = collada_material.Effect(
-        f"{texture.material_name}-effect",
+        f"{name}-effect",
         params,
         "phong",
         diffuse=color_map,
         specular=(0.0, 0.0, 0.0, 1.0),
         transparent=transparent,
         transparency=transparency,
+        double_sided=material_key.double_sided,
     )
     if not has_transparency:
         # pycollada defaults to writing a transparency value; omit it for
         # opaque textures so importers do not infer unintended alpha behavior.
         effect.transparent = None
         effect.transparency = None
-    mat = collada_material.Material(
-        texture.material_name,
-        texture.material_name,
-        effect,
-    )
+    mat = collada_material.Material(name, name, effect)
     mesh.effects.append(effect)
     mesh.materials.append(mat)
     return mat
@@ -1457,6 +1397,7 @@ def _dae_geometry_for_group(
     mesh: Collada,
     group: _MeshGroup,
     group_index: int,
+    material_symbol: str,
     animation_plan: _TextureAnimationPlan | None = None,
 ) -> collada_geometry.Geometry:
     geom_id = f"geometry{group_index}"
@@ -1499,6 +1440,16 @@ def _dae_geometry_for_group(
     input_list.addInput(0, "VERTEX", f"#{geom_id}-vertices")
     input_list.addInput(0, "COLOR", f"#{geom_id}-colors")
 
+    if group.vertex_normals:
+        sources.append(
+            source.FloatSource(
+                f"{geom_id}-normals",
+                numpy_array([axis for normal in group.vertex_normals for axis in normal]),
+                ("X", "Y", "Z"),
+            )
+        )
+        input_list.addInput(0, "NORMAL", f"#{geom_id}-normals")
+
     if group.texture is not None:
         src_texcoords = source.FloatSource(
             f"{geom_id}-texcoords",
@@ -1512,26 +1463,22 @@ def _dae_geometry_for_group(
     triset = geom.createTriangleSet(
         numpy_array(triangles),
         input_list,
-        _dae_material_symbol(group.texture),
+        material_symbol,
     )
     geom.primitives.append(triset)
     return geom
 
 
-def _dae_material_symbol(texture: _TextureKey | None) -> str:
-    if texture is None:
-        return "vertex-material"
-    return texture.material_name
-
-
 _GLTF_ARRAY_BUFFER = 34962
 _GLTF_ELEMENT_ARRAY_BUFFER = 34963
 _GLTF_FLOAT = 5126
+_GLTF_UNSIGNED_BYTE = 5121
 _GLTF_UNSIGNED_SHORT = 5123
 _GLTF_UNSIGNED_INT = 5125
 _GLTF_TRIANGLES = 4
 _GLTF_REPEAT = 10497
 _GLTF_CLAMP_TO_EDGE = 33071
+_GLTF_LINEAR = 9729
 
 
 class _GltfBinaryBuilder:
@@ -1560,9 +1507,7 @@ class _GltfBinaryBuilder:
 def _gltf_mesh(
     groups: tuple[_MeshGroup, ...],
     texture_plans: tuple[_TextureExportPlan, ...],
-    binary_filename: str | None,
-    texture_folder: str,
-    embedded_images: tuple[TextureImageFile, ...],
+    skeleton: tuple[ModelBone, ...] = tuple(),
 ) -> tuple[dict[str, object], bytes]:
     binary = _GltfBinaryBuilder()
     gltf: dict[str, object] = {
@@ -1575,69 +1520,48 @@ def _gltf_mesh(
         "scenes": [{"nodes": []}],
         "nodes": [],
         "meshes": [],
-        "materials": [_gltf_vertex_material(blended=False)],
+        "materials": [],
     }
-    material_indices: dict[_GltfMaterialKey, int] = {
-        _GltfMaterialKey(None, False): 0
+    default_material = _MaterialKey(None, False)
+    material_indices: dict[_MaterialKey, int] = {
+        default_material: _gltf_add_material(gltf, default_material, {})
     }
-    texture_indices = _gltf_add_texture_resources(
-        gltf,
-        binary,
-        texture_plans,
-        texture_folder,
-        embedded_images,
-    )
+    texture_indices = _gltf_add_texture_resources(gltf, binary, texture_plans)
     texture_plans_by_texture = {
         texture_plan.texture: texture_plan for texture_plan in texture_plans
     }
+    skin_index = _gltf_add_skin(gltf, binary, skeleton)
 
     for group_index, group in enumerate(groups):
         if not group.vertices or not group.triangles:
             continue
-        material_key = _gltf_material_key(group, texture_plans_by_texture)
+        material_key = _material_key(group, texture_plans_by_texture)
         material_index = material_indices.get(material_key)
         if material_index is None:
-            material_index = _gltf_add_material(
-                gltf,
-                material_key,
-                texture_plans_by_texture,
-                texture_indices,
-            )
+            material_index = _gltf_add_material(gltf, material_key, texture_indices)
             material_indices[material_key] = material_index
-        mesh_index = _gltf_add_mesh(gltf, binary, group, group_index, material_index)
-        node_index = _gltf_append(
+        mesh_index = _gltf_add_mesh(
             gltf,
-            "nodes",
-            {
-                "name": f"mesh_group_{group_index}",
-                "mesh": mesh_index,
-            },
+            binary,
+            group,
+            group_index,
+            material_index,
+            skinned=skin_index is not None,
         )
+        node: dict[str, object] = {
+            "name": f"mesh_group_{group_index}",
+            "mesh": mesh_index,
+        }
+        if skin_index is not None:
+            node["skin"] = skin_index
+        node_index = _gltf_append(gltf, "nodes", node)
         gltf["scenes"][0]["nodes"].append(node_index)
 
     binary_data = binary.to_bytes()
     gltf["buffers"] = [{"byteLength": len(binary_data)}]
-    if binary_filename is not None:
-        gltf["buffers"][0]["uri"] = pathlib.PurePosixPath(binary_filename).as_posix()
     if binary.buffer_views:
         gltf["bufferViews"] = binary.buffer_views
     return gltf, binary_data
-
-
-def _gltf_material_key(
-    group: _MeshGroup,
-    texture_plans_by_texture: dict[_TextureKey, _TextureExportPlan],
-) -> _GltfMaterialKey:
-    texture_has_alpha = False
-    if group.texture is not None:
-        texture_plan = texture_plans_by_texture.get(group.texture)
-        texture_has_alpha = bool(
-            texture_plan and _texture_level_has_transparency(texture_plan.levels[0])
-        )
-    return _GltfMaterialKey(
-        group.texture,
-        texture_has_alpha or _mesh_group_has_vertex_transparency(group),
-    )
 
 
 def _mesh_group_has_vertex_transparency(group: _MeshGroup) -> bool:
@@ -1655,57 +1579,46 @@ def _mesh_group_has_vertex_transparency(group: _MeshGroup) -> bool:
 
 def _gltf_add_material(
     gltf: dict[str, object],
-    material_key: _GltfMaterialKey,
-    texture_plans_by_texture: dict[_TextureKey, _TextureExportPlan],
+    material_key: _MaterialKey,
     texture_indices: dict[_TextureKey, int],
 ) -> int:
     if material_key.texture is None:
-        material = _gltf_vertex_material(blended=material_key.blended)
+        base_color = {"baseColorFactor": [1.0, 1.0, 1.0, 1.0]}
     else:
-        material = _gltf_texture_material(
-            texture_plans_by_texture[material_key.texture],
-            texture_indices[material_key.texture],
-            blended=material_key.blended,
-        )
-    return _gltf_append(gltf, "materials", material)
-
-
-def _gltf_vertex_material(blended: bool) -> dict[str, object]:
+        base_color = {
+            "baseColorTexture": {
+                "index": texture_indices[material_key.texture],
+                "texCoord": 0,
+            }
+        }
     material: dict[str, object] = {
-        "name": "vertex-material-blend" if blended else "vertex-material",
-        "doubleSided": True,
+        "name": material_key.name,
+        "doubleSided": material_key.double_sided and not material_key.blended,
         "pbrMetallicRoughness": {
-            "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+            **base_color,
             "metallicFactor": 0.0,
             "roughnessFactor": 1.0,
         },
-        "extensions": {"KHR_materials_unlit": {}},
     }
-    if blended:
+    if material_key.blended:
         material["alphaMode"] = "BLEND"
-    return material
+    elif material_key.masked:
+        material["alphaMode"] = "MASK"
+        material["alphaCutoff"] = 0.5
+    if not material_key.lit:
+        material["extensions"] = {"KHR_materials_unlit": {}}
+    return _gltf_append(gltf, "materials", material)
 
 
 def _gltf_add_texture_resources(
     gltf: dict[str, object],
     binary: _GltfBinaryBuilder,
     texture_plans: tuple[_TextureExportPlan, ...],
-    texture_folder: str,
-    embedded_images: tuple[TextureImageFile, ...],
 ) -> dict[_TextureKey, int]:
-    embedded_images_by_name = {
-        pathlib.PurePosixPath(image.filename).name: image for image in embedded_images
-    }
     texture_indices = {}
     for texture_plan in texture_plans:
         texture = texture_plan.texture
-        image_index = _gltf_add_image(
-            gltf,
-            binary,
-            texture,
-            texture_folder,
-            embedded_images_by_name,
-        )
+        image_index = _gltf_add_image(gltf, binary, texture_plan)
         sampler_index = _gltf_append(gltf, "samplers", _gltf_sampler(texture))
         texture_index = _gltf_append(
             gltf,
@@ -1723,53 +1636,79 @@ def _gltf_add_texture_resources(
 def _gltf_add_image(
     gltf: dict[str, object],
     binary: _GltfBinaryBuilder,
-    texture: _TextureKey,
-    texture_folder: str,
-    embedded_images_by_name: dict[str, TextureImageFile],
+    texture_plan: _TextureExportPlan,
 ) -> int:
+    base_level = texture_plan.levels[0]
     image = {
-        "name": texture.material_name,
+        "name": texture_plan.texture.material_name,
+        "bufferView": binary.add_view(
+            rgba_to_png(base_level.width, base_level.height, base_level.rgba)
+        ),
+        "mimeType": "image/png",
     }
-    embedded_image = embedded_images_by_name.get(texture.image_filename)
-    if embedded_image is None:
-        image["uri"] = _texture_asset_filename(texture_folder, texture.image_filename)
-    else:
-        image["bufferView"] = binary.add_view(embedded_image.data)
-        image["mimeType"] = "image/png"
     return _gltf_append(gltf, "images", image)
 
 
 def _gltf_sampler(texture: _TextureKey) -> dict[str, int]:
     return {
+        "magFilter": _GLTF_LINEAR,
+        "minFilter": _GLTF_LINEAR,
         "wrapS": _GLTF_CLAMP_TO_EDGE if texture.clamp_s else _GLTF_REPEAT,
         "wrapT": _GLTF_CLAMP_TO_EDGE if texture.clamp_t else _GLTF_REPEAT,
     }
 
 
-def _gltf_texture_material(
-    texture_plan: _TextureExportPlan,
-    texture_index: int,
-    blended: bool,
-) -> dict[str, object]:
-    name = texture_plan.texture.material_name
-    if blended and not _texture_level_has_transparency(texture_plan.levels[0]):
-        name = f"{name}_vertex_alpha"
-    material: dict[str, object] = {
-        "name": name,
-        "doubleSided": True,
-        "pbrMetallicRoughness": {
-            "baseColorTexture": {
-                "index": texture_index,
-                "texCoord": 0,
+def _gltf_add_skin(
+    gltf: dict[str, object],
+    binary: _GltfBinaryBuilder,
+    skeleton: tuple[ModelBone, ...],
+) -> int | None:
+    if not skeleton:
+        return None
+
+    first_node = len(gltf["nodes"])
+    for bone in skeleton:
+        _gltf_append(
+            gltf,
+            "nodes",
+            {
+                "name": f"bone_{bone.index:02d}",
+                "translation": [float(value) for value in bone.local],
             },
-            "metallicFactor": 0.0,
-            "roughnessFactor": 1.0,
+        )
+    for bone in skeleton:
+        if 0 <= bone.parent < len(skeleton):
+            parent_node = gltf["nodes"][first_node + bone.parent]
+            parent_node.setdefault("children", []).append(first_node + bone.index)
+        else:
+            gltf["scenes"][0]["nodes"].append(first_node + bone.index)
+
+    payload = b"".join(
+        struct.pack(
+            "<16f",
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            -bone.world[0], -bone.world[1], -bone.world[2], 1.0,
+        )
+        for bone in skeleton
+    )
+    return _gltf_append(
+        gltf,
+        "skins",
+        {
+            "joints": [first_node + bone.index for bone in skeleton],
+            "inverseBindMatrices": _gltf_add_accessor(
+                gltf,
+                binary,
+                payload,
+                count=len(skeleton),
+                component_type=_GLTF_FLOAT,
+                accessor_type="MAT4",
+                target=None,
+            ),
         },
-        "extensions": {"KHR_materials_unlit": {}},
-    }
-    if blended:
-        material["alphaMode"] = "BLEND"
-    return material
+    )
 
 
 def _gltf_add_mesh(
@@ -1778,6 +1717,7 @@ def _gltf_add_mesh(
     group: _MeshGroup,
     group_index: int,
     material_index: int,
+    skinned: bool = False,
 ) -> int:
     attributes = {
         "POSITION": _gltf_add_position_accessor(gltf, binary, group.vertices),
@@ -1789,6 +1729,14 @@ def _gltf_add_mesh(
             binary,
             group.vertices,
             group.texture,
+        )
+    if group.vertex_normals:
+        attributes["NORMAL"] = _gltf_add_normal_accessor(
+            gltf, binary, group.vertex_normals
+        )
+    if skinned:
+        attributes.update(
+            _gltf_add_skinning_accessors(gltf, binary, group.vertex_bones)
         )
 
     mesh = {
@@ -1834,6 +1782,48 @@ def _gltf_add_position_accessor(
             float(max(vertex.y for vertex in vertices)),
             float(max(vertex.z for vertex in vertices)),
         ],
+    )
+
+
+def _gltf_add_skinning_accessors(
+    gltf: dict[str, object],
+    binary: _GltfBinaryBuilder,
+    vertex_bones: tuple[int, ...],
+) -> dict[str, int]:
+    joints = _gltf_add_accessor(
+        gltf,
+        binary,
+        b"".join(struct.pack("<4B", bone, 0, 0, 0) for bone in vertex_bones),
+        count=len(vertex_bones),
+        component_type=_GLTF_UNSIGNED_BYTE,
+        accessor_type="VEC4",
+        target=_GLTF_ARRAY_BUFFER,
+    )
+    weights = _gltf_add_accessor(
+        gltf,
+        binary,
+        struct.pack("<4f", 1.0, 0.0, 0.0, 0.0) * len(vertex_bones),
+        count=len(vertex_bones),
+        component_type=_GLTF_FLOAT,
+        accessor_type="VEC4",
+        target=_GLTF_ARRAY_BUFFER,
+    )
+    return {"JOINTS_0": joints, "WEIGHTS_0": weights}
+
+
+def _gltf_add_normal_accessor(
+    gltf: dict[str, object],
+    binary: _GltfBinaryBuilder,
+    normals: tuple[tuple[float, float, float], ...],
+) -> int:
+    return _gltf_add_accessor(
+        gltf,
+        binary,
+        b"".join(struct.pack("<fff", *normal) for normal in normals),
+        count=len(normals),
+        component_type=_GLTF_FLOAT,
+        accessor_type="VEC3",
+        target=_GLTF_ARRAY_BUFFER,
     )
 
 
@@ -1924,7 +1914,7 @@ def _gltf_add_accessor(
     count: int,
     component_type: int,
     accessor_type: str,
-    target: int,
+    target: int | None,
     minimum: list[float | int] | None = None,
     maximum: list[float | int] | None = None,
 ) -> int:
@@ -3180,6 +3170,28 @@ def _swap_pixel_group_halves_rgba(row_rgba: bytes, group_pixels: int) -> bytes:
     return bytes(swapped)
 
 
+def _deswizzle_tmem_rows(
+    data: bytes,
+    width: int,
+    height: int,
+    bits: int,
+) -> bytes:
+    row_bytes = width * bits // 8
+    half = 8 if bits == 32 else 4
+    if row_bytes < half * 2 or row_bytes % (half * 2) or len(data) < row_bytes * height:
+        return data
+
+    rows = bytearray(data[: row_bytes * height])
+    for row in range(1, height, 2):
+        base = row * row_bytes
+        for word in range(base, base + row_bytes, half * 2):
+            rows[word : word + half], rows[word + half : word + half * 2] = (
+                bytes(rows[word + half : word + half * 2]),
+                bytes(rows[word : word + half]),
+            )
+    return bytes(rows)
+
+
 def _vertices_for_command(display_list: object, command: commands.G_VTX) -> list[Vertex]:
     vertex_address = int.from_bytes(command.address, "big")
     vertex_buffer_start = display_list.vertex_pointer + vertex_address
@@ -3195,12 +3207,6 @@ def _vertices_for_command(display_list: object, command: commands.G_VTX) -> list
         Vertex.from_bytes(vertex_data[index : index + 16])
         for index in range(0, len(vertex_data), 16)
     ]
-
-
-def _tile_dimensions(command: commands.G_SETTILESIZE) -> tuple[int, int]:
-    width = max(1, abs(command.lrs - command.uls) // 4 + 1)
-    height = max(1, abs(command.lrt - command.ult) // 4 + 1)
-    return width, height
 
 
 def _uv_for_vertex(vertex: Vertex, texture: _TextureKey) -> tuple[float, float]:
@@ -3225,10 +3231,6 @@ def _gltf_uv_for_vertex(vertex: Vertex, texture: _TextureKey) -> tuple[float, fl
 
 def _clamp_unit(value: float) -> float:
     return max(0.0, min(1.0, value))
-
-
-def _signed_16(value: int) -> int:
-    return value - 0x10000 if value & 0x8000 else value
 
 
 def _decode_rgba16(data: bytes, width: int, height: int) -> bytes:

@@ -1,3 +1,4 @@
+import base64
 import json
 import struct
 import tempfile
@@ -15,6 +16,7 @@ from dk64_lib.f3dex2.texture_export import (
     TexturedObjExporter,
     TexturedObjSupportFile,
     decode_texture,
+    display_list_mesh_groups,
     rgba_to_png,
     save_textured_dae_export,
     save_textured_glb_export,
@@ -125,6 +127,7 @@ def _textured_triangle_display_list(
     cm_s: int = 0,
     cm_t: int = 0,
     vertex_colors: tuple[tuple[int, int, int, int], ...] | None = None,
+    combine: bytes | None = None,
 ) -> DisplayList:
     if vertex_colors is None:
         vertex_colors = (
@@ -133,7 +136,8 @@ def _textured_triangle_display_list(
             (255, 255, 255, 255),
         )
     image_type = (fmt << 5) | (size << 3)
-    commands = [
+    commands = [combine] if combine else []
+    commands += [
         _g_texture(level=3),
         _words(0xFD000000 | (image_type << 16), texture_index),
         _settile(fmt=fmt, size=size, tile=7),
@@ -217,6 +221,13 @@ def _glb_chunks(data: bytes) -> tuple[dict, bytes]:
     return json_chunk, bin_chunk
 
 
+def _gltf_buffer(gltf: dict) -> bytes:
+    uri = gltf["buffers"][0]["uri"]
+    header, _, payload = uri.partition(",")
+    assert header.endswith(";base64"), header
+    return base64.b64decode(payload)
+
+
 def _gltf_accessor_floats(gltf: dict, binary_data: bytes, accessor_index: int) -> tuple[float, ...]:
     accessor = gltf["accessors"][accessor_index]
     buffer_view = gltf["bufferViews"][accessor["bufferView"]]
@@ -285,7 +296,7 @@ class TextureExportTest(unittest.TestCase):
             offset=0,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertIn("mtllib model.mtl", export.obj_data)
         self.assertIn("v 0 0 0 1.000000 0.000000 0.501961", export.obj_data)
@@ -318,7 +329,7 @@ class TextureExportTest(unittest.TestCase):
             cm_t=2,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertIn("illum 4", export.mtl_data)
         self.assertIn(
@@ -342,8 +353,9 @@ class TextureExportTest(unittest.TestCase):
         )
         blender_script = export.support_files[0].data
         self.assertIn("'tex_0_pal_none_f0_s2_2x2_clamp_t'", blender_script)
-        self.assertIn('"surface_render_method", "BLENDED"', blender_script)
-        self.assertIn('"blend_method", "BLEND"', blender_script)
+        self.assertIn('"surface_render_method", "DITHERED"', blender_script)
+        self.assertIn('"blend_method", "CLIP"', blender_script)
+        self.assertNotIn('"BLENDED"', blender_script)
         alpha_size, alpha_pixels = _png_rgba(export.images[1].data)
         self.assertEqual(alpha_size, (2, 2))
         self.assertEqual(
@@ -369,6 +381,48 @@ class TextureExportTest(unittest.TestCase):
                 )
             ),
         )
+
+    def test_exporters_draw_texture_solid_when_combiner_ignores_its_alpha(self):
+        texture_data = [
+            SimpleNamespace(
+                raw_data=(
+                    _rgba16(255, 0, 0, 0)
+                    + _rgba16(0, 255, 0)
+                    + _rgba16(0, 0, 255)
+                    + _rgba16(255, 255, 255)
+                )
+            )
+        ]
+        display_list = _textured_triangle_display_list(
+            texture_index=0,
+            fmt=0,
+            size=2,
+            width=2,
+            height=2,
+            combine=_words(0xFC127E24, 0xFFFFF9FC),
+        )
+        groups = display_list_mesh_groups([display_list])
+
+        export = TexturedObjExporter(texture_data).export(groups, "model.mtl")
+
+        self.assertIn("usemtl tex_0_pal_none_f0_s2_2x2_solid", export.obj_data)
+        self.assertIn("illum 1", export.mtl_data)
+        self.assertNotIn("map_d", export.mtl_data)
+        self.assertEqual(export.support_files, tuple())
+
+        dae_export = TexturedDaeExporter(texture_data).export(groups)
+        self.assertEqual(
+            [image.path for image in dae_export.dae.images],
+            ["textures/tex_0_pal_none_f0_s2_2x2.png"],
+        )
+
+        gltf = json.loads(TexturedGltfExporter(texture_data).export(groups).gltf_data)
+        material = next(
+            material
+            for material in gltf["materials"]
+            if material["name"] == "tex_0_pal_none_f0_s2_2x2_solid"
+        )
+        self.assertEqual(material.get("alphaMode", "OPAQUE"), "OPAQUE")
 
     def test_exporter_emits_clamp_hint_and_clamps_uvs_for_clamped_tile(self):
         texture_data = [
@@ -405,7 +459,7 @@ class TextureExportTest(unittest.TestCase):
             offset=0,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertIn("usemtl tex_0_pal_none_f0_s2_2x2_clamp_st", export.obj_data)
         self.assertIn("vt 0.00000000 1.00000000", export.obj_data)
@@ -416,6 +470,54 @@ class TextureExportTest(unittest.TestCase):
             export.mtl_data,
         )
         self.assertNotIn("map_d", export.mtl_data)
+
+    def test_obj_exporter_separates_groups_and_names_every_material(self):
+        texture_data = [
+            SimpleNamespace(
+                raw_data=(
+                    _rgba16(255, 0, 0)
+                    + _rgba16(0, 255, 0)
+                    + _rgba16(0, 0, 255)
+                    + _rgba16(255, 255, 255)
+                )
+            )
+        ]
+        image_type = (0 << 5) | (2 << 3)
+        commands = (
+            _g_texture(level=3)
+            + _words(0xFD000000 | (image_type << 16), 0)
+            + _settile(fmt=0, size=2, tile=7)
+            + _words(0xF3000000, 0x07000000)
+            + _settile(fmt=0, size=2, tile=0)
+            + _settilesize(tile=0, width=2, height=2)
+            + b"\x01\x00\x30\x06\x00\x00\x00\x00"
+            + b"\x05\x00\x02\x04\x00\x00\x00\x00"
+            + _g_texture(level=0, on=0)
+            + b"\x01\x00\x30\x06\x00\x00\x00\x30"
+            + b"\x05\x00\x02\x04\x00\x00\x00\x00"
+            + b"\xdf\x00\x00\x00\x00\x00\x00\x00"
+        )
+        display_list = DisplayList(
+            raw_data=commands,
+            raw_vertex_data=(
+                _vertex(0, 0, 0, 0, 0)
+                + _vertex(1, 0, 0, 64, 0)
+                + _vertex(0, 1, 0, 0, 64)
+                + _vertex(0, 0, 9, 0, 0)
+                + _vertex(1, 0, 9, 0, 0)
+                + _vertex(0, 1, 9, 0, 0)
+            ),
+            vertex_pointer=0,
+            offset=0,
+        )
+
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
+
+        self.assertIn("o mesh_group_0", export.obj_data)
+        self.assertIn("o mesh_group_1", export.obj_data)
+        self.assertIn("usemtl tex_0_pal_none_f0_s2_2x2", export.obj_data)
+        self.assertIn("usemtl vertex-material", export.obj_data)
+        self.assertIn("newmtl vertex-material", export.mtl_data)
 
     def test_dae_exporter_writes_textured_materials_and_alpha(self):
         texture_data = [
@@ -437,7 +539,7 @@ class TextureExportTest(unittest.TestCase):
             cm_t=2,
         )
 
-        export = TexturedDaeExporter(texture_data).export([display_list])
+        export = TexturedDaeExporter(texture_data).export(display_list_mesh_groups([display_list]))
 
         self.assertEqual(
             [image.filename for image in export.images],
@@ -502,7 +604,7 @@ class TextureExportTest(unittest.TestCase):
         )
 
         export = TexturedDaeExporter(texture_data).export(
-            [display_list],
+            display_list_mesh_groups([display_list]),
             animated_texture_frames={0: [0, 1]},
             animation_frame_duration=3,
         )
@@ -605,31 +707,26 @@ class TextureExportTest(unittest.TestCase):
             cm_t=2,
         )
 
-        export = TexturedGltfExporter(texture_data).export(
-            [display_list],
-            binary_filename="model.bin",
-        )
+        export = TexturedGltfExporter(texture_data).export(display_list_mesh_groups([display_list]))
         gltf = json.loads(export.gltf_data)
+        binary_data = _gltf_buffer(gltf)
 
-        self.assertEqual(export.binary_filename, "model.bin")
-        self.assertGreater(len(export.binary_data), 0)
-        self.assertEqual(
-            [image.filename for image in export.images],
-            ["textures/tex_0_pal_none_f0_s2_2x2_clamp_t.png"],
+        self.assertGreater(len(binary_data), 0)
+        self.assertTrue(
+            gltf["buffers"][0]["uri"].startswith("data:application/octet-stream;base64,")
         )
-        self.assertEqual(gltf["buffers"][0]["uri"], "model.bin")
-        self.assertEqual(gltf["buffers"][0]["byteLength"], len(export.binary_data))
+        self.assertEqual(gltf["buffers"][0]["byteLength"], len(binary_data))
         self.assertEqual(
-            gltf["images"],
-            [
-                {
-                    "name": "tex_0_pal_none_f0_s2_2x2_clamp_t",
-                    "uri": "textures/tex_0_pal_none_f0_s2_2x2_clamp_t.png",
-                }
-            ],
+            [image["name"] for image in gltf["images"]],
+            ["tex_0_pal_none_f0_s2_2x2_clamp_t"],
         )
-        self.assertEqual(gltf["samplers"], [{"wrapS": 10497, "wrapT": 33071}])
-        self.assertEqual(gltf["materials"][1]["alphaMode"], "BLEND")
+        self.assertEqual(gltf["images"][0]["mimeType"], "image/png")
+        self.assertNotIn("uri", gltf["images"][0])
+        self.assertEqual(
+            gltf["samplers"],
+            [{"magFilter": 9729, "minFilter": 9729, "wrapS": 10497, "wrapT": 33071}],
+        )
+        self.assertEqual(gltf["materials"][1]["alphaMode"], "MASK")
         self.assertEqual(
             gltf["materials"][1]["pbrMetallicRoughness"]["baseColorTexture"],
             {"index": 0, "texCoord": 0},
@@ -644,7 +741,7 @@ class TextureExportTest(unittest.TestCase):
         self.assertEqual(
             _gltf_accessor_floats(
                 gltf,
-                export.binary_data,
+                binary_data,
                 primitive["attributes"]["TEXCOORD_0"],
             ),
             (0.0, 0.0, 1.0, 0.0, 0.0, 1.0),
@@ -675,13 +772,13 @@ class TextureExportTest(unittest.TestCase):
             ),
         )
 
-        export = TexturedGltfExporter(texture_data).export([display_list])
+        export = TexturedGltfExporter(texture_data).export(display_list_mesh_groups([display_list]))
         gltf = json.loads(export.gltf_data)
         primitive = gltf["meshes"][0]["primitives"][0]
 
         color_values = _gltf_accessor_floats(
             gltf,
-            export.binary_data,
+            _gltf_buffer(gltf),
             primitive["attributes"]["COLOR_0"],
         )
 
@@ -714,15 +811,18 @@ class TextureExportTest(unittest.TestCase):
             cm_t=2,
         )
 
-        export = TexturedGltfExporter(texture_data).export_glb([display_list])
+        export = TexturedGltfExporter(texture_data).export_glb(display_list_mesh_groups([display_list]))
         gltf, bin_chunk = _glb_chunks(export.data)
 
         self.assertGreater(len(bin_chunk), 0)
         self.assertNotIn("uri", gltf["buffers"][0])
         self.assertEqual(gltf["images"][0]["mimeType"], "image/png")
         self.assertIn("bufferView", gltf["images"][0])
-        self.assertEqual(gltf["samplers"], [{"wrapS": 33071, "wrapT": 33071}])
-        self.assertEqual(gltf["materials"][1]["alphaMode"], "BLEND")
+        self.assertEqual(
+            gltf["samplers"],
+            [{"magFilter": 9729, "minFilter": 9729, "wrapS": 33071, "wrapT": 33071}],
+        )
+        self.assertEqual(gltf["materials"][1]["alphaMode"], "MASK")
         self.assertEqual(
             set(gltf["meshes"][0]["primitives"][0]["attributes"]),
             {"POSITION", "COLOR_0", "TEXCOORD_0"},
@@ -768,7 +868,7 @@ class TextureExportTest(unittest.TestCase):
             offset=0,
         )
 
-        export = TexturedGltfExporter(texture_data).export_glb([display_list])
+        export = TexturedGltfExporter(texture_data).export_glb(display_list_mesh_groups([display_list]))
         gltf, _bin_chunk = _glb_chunks(export.data)
 
         self.assertEqual(len(gltf["meshes"]), 1)
@@ -803,7 +903,7 @@ class TextureExportTest(unittest.TestCase):
             ),
         )
 
-        export = TexturedGltfExporter(texture_data).export_glb([display_list])
+        export = TexturedGltfExporter(texture_data).export_glb(display_list_mesh_groups([display_list]))
         gltf, _bin_chunk = _glb_chunks(export.data)
 
         material = gltf["materials"][1]
@@ -862,7 +962,7 @@ class TextureExportTest(unittest.TestCase):
             offset=0,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertIn("usemtl tex_0_pal_none_f0_s2_2x2", export.obj_data)
         self.assertIn("map_Kd textures/tex_0_pal_none_f0_s2_2x2.png", export.mtl_data)
@@ -916,7 +1016,7 @@ class TextureExportTest(unittest.TestCase):
             offset=0,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertEqual(
             [image.filename for image in export.images],
@@ -951,7 +1051,7 @@ class TextureExportTest(unittest.TestCase):
             height=32,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertIn("usemtl tex_2_pal_none_f0_s2_32x32", export.obj_data)
         self.assertIn(
@@ -1007,7 +1107,7 @@ class TextureExportTest(unittest.TestCase):
             palette_index=1,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertIn("usemtl tex_0_pal_1_f2_s0_32x64", export.obj_data)
         self.assertIn(
@@ -1044,7 +1144,7 @@ class TextureExportTest(unittest.TestCase):
             palette_index=209,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertIn("usemtl tex_208_pal_209_f2_s0_64x32", export.obj_data)
         self.assertIn(
@@ -1081,7 +1181,7 @@ class TextureExportTest(unittest.TestCase):
             palette_index=159,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertIn("usemtl tex_158_pal_159_f2_s1_32x32", export.obj_data)
         self.assertIn(
@@ -1244,7 +1344,7 @@ class TextureExportTest(unittest.TestCase):
             palette_index=1273,
         )
 
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         self.assertIn("usemtl tex_1272_pal_1273_f2_s0_32x32", export.obj_data)
         self.assertIn(
@@ -1879,7 +1979,7 @@ class TextureExportTest(unittest.TestCase):
             vertex_pointer=0,
             offset=0,
         )
-        export = TexturedObjExporter(texture_data).export([display_list], "model.mtl")
+        export = TexturedObjExporter(texture_data).export(display_list_mesh_groups([display_list]), "model.mtl")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             export_folder = Path(tmpdir) / "nested"
@@ -1955,7 +2055,7 @@ class TextureExportTest(unittest.TestCase):
             width=2,
             height=2,
         )
-        export = TexturedDaeExporter(texture_data).export([display_list])
+        export = TexturedDaeExporter(texture_data).export(display_list_mesh_groups([display_list]))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             export_folder = Path(tmpdir) / "nested"
@@ -1998,10 +2098,7 @@ class TextureExportTest(unittest.TestCase):
             width=2,
             height=2,
         )
-        export = TexturedGltfExporter(texture_data).export(
-            [display_list],
-            binary_filename="model.bin",
-        )
+        export = TexturedGltfExporter(texture_data).export(display_list_mesh_groups([display_list]))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             export_folder = Path(tmpdir) / "nested"
@@ -2011,19 +2108,11 @@ class TextureExportTest(unittest.TestCase):
                 export_folder,
             )
 
+            self.assertEqual(written_paths, [export_folder / "model.gltf"])
             self.assertEqual(
-                written_paths,
-                [
-                    export_folder / "model.gltf",
-                    export_folder / "model.bin",
-                    export_folder
-                    / "textures"
-                    / "tex_0_pal_none_f0_s2_2x2.png",
-                ],
+                sorted(path.name for path in export_folder.iterdir()),
+                ["model.gltf"],
             )
-            self.assertTrue((export_folder / "model.gltf").exists())
-            self.assertTrue((export_folder / "model.bin").exists())
-            self.assertTrue(written_paths[-1].exists())
 
     def test_save_textured_glb_export_writes_binary_asset(self):
         texture_data = [
@@ -2043,7 +2132,7 @@ class TextureExportTest(unittest.TestCase):
             width=2,
             height=2,
         )
-        export = TexturedGltfExporter(texture_data).export_glb([display_list])
+        export = TexturedGltfExporter(texture_data).export_glb(display_list_mesh_groups([display_list]))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             export_folder = Path(tmpdir) / "nested"

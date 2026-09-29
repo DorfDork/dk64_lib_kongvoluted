@@ -34,18 +34,6 @@ class FloorCollisionData(StubTableData):
     description = "Floor collision data."
 
 
-class ModelTwoGeometryData(StubTableData):
-    table_id = 4
-    table_name = "Model Two Geometry"
-    description = "Model two geometry data; exact model category is not decoded yet."
-
-
-class ActorGeometryData(StubTableData):
-    table_id = 5
-    table_name = "Actor Geometry"
-    description = "Actor geometry data, likely including bones and texture references."
-
-
 class SetupData(StubTableData):
     table_id = 9
     table_name = "Setup"
@@ -143,8 +131,6 @@ STUB_TABLE_DATA_TYPES: dict[int, type[StubTableData]] = {
         MidiMusicData,
         WallCollisionData,
         FloorCollisionData,
-        ModelTwoGeometryData,
-        ActorGeometryData,
         SetupData,
         InstanceScriptData,
         AnimationData,

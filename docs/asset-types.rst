@@ -32,12 +32,12 @@ The high-level ROM facade currently knows these table families:
      - Stubbed as raw floor collision records.
    * - ``4``
      - Model two geometry
-     - Stubbed as raw model two geometry records. The exact meaning of
-       "model two" still needs to be decoded.
+     - Parsed into prop geometry objects and exported as OBJ/MTL/PNG,
+       glTF/PNG, GLB, or DAE/PNG files.
    * - ``5``
      - Actor geometry
-     - Stubbed as raw actor geometry records, likely including bones and
-       texture references.
+     - Parsed into actor geometry objects and exported as OBJ/MTL/PNG,
+       glTF/PNG, GLB, or DAE/PNG files.
    * - ``7``
      - Textures
      - Exported as guessed PNGs when byte size matches a known RGBA5551 size.
@@ -116,17 +116,28 @@ depending on the ROM type.
 Geometry Data
 -------------
 
-:class:`dk64_lib.data_types.geometry.GeometryData` parses map geometry table
+:class:`dk64_lib.data_types.geometry.StageModelData` parses map geometry table
 entries. A geometry entry can also be a pointer record that references another
 geometry table entry.
 
+:class:`dk64_lib.data_types.geometry.ActorModelData` parses the actor model table.
+
+:class:`dk64_lib.data_types.geometry.PropModelData` parses the prop model tables.
+
+:class:`dk64_lib.f3dex2.display_list.ModelDecoder` decodes display lists into F3DEX2 commands, vertices, and triangles.
+
 Parsed geometry exposes:
 
-* ``display_lists`` as :class:`dk64_lib.f3dex2.display_list.DisplayList`
-  objects.
-* ``vertex_chunk_data`` as 52-byte display-list chunk metadata records.
-* ``dl_expansions`` for expansion records that point at additional display
-  lists.
+* ``index``: the ID in the pointer table entry.
+* ``name``: the name of the geometry objects.
+* ``mesh_groups``: the triangles, grouped by the texture they are drawn with.
+* ``display_lists`` as :class:`dk64_lib.f3dex2.display_list.DisplayList` objects (stage only).
+* ``vertex_chunk_data`` as 52-byte display-list chunk metadata records (stage only).
+* ``dl_expansions`` for expansion records that point at additional display lists (stage only).
+* ``bones``: the bind pose skeleton (actor only).
+* ``bone_count``: the number of bones in the header (actor only).
+* ``category``: the group name of geometry objects (prop only).
+* ``model_type``: the model type of which ``1`` is geometry (prop only).
 * ``save_to_obj()`` for OBJ export, textured by default.
 * ``save_to_gltf()`` for separate glTF JSON, binary, and PNG export.
 * ``save_to_glb()`` for single-file binary glTF export.
@@ -181,8 +192,8 @@ understood.
 
 Use :meth:`dk64_lib.rom.Rom.get_stub_table_data` for a specific table ID, or
 one of the named convenience methods such as ``get_animation_data()`` or
-``get_actor_geometry_data()``. Tables ``6`` and ``20`` are still unlabeled in
-the library.
+``get_setup_data()``. Tables ``6`` and ``20`` are still unlabeled in the
+library.
 
 Raw Assets
 ----------

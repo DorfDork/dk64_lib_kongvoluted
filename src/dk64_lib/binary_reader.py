@@ -1,3 +1,6 @@
+from struct import unpack_from
+
+
 class BinaryReader:
     """Read big-endian values from an immutable byte buffer."""
 
@@ -26,6 +29,10 @@ class BinaryReader:
 
     def read_u32(self, offset: int) -> int:
         return int.from_bytes(self.read_at(offset, 4), "big")
+
+    def read_f32(self, offset: int) -> float:
+        self._validate_range(offset, 4)
+        return unpack_from(">f", self._data, offset)[0]
 
     def _validate_range(self, offset: int, size: int) -> None:
         if offset < 0:

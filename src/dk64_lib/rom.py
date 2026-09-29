@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import zlib
 
 from dataclasses import dataclass
@@ -6,10 +8,10 @@ from tempfile import TemporaryFile
 from functools import cache, cached_property
 from re import sub
 
-from typing import Literal, Generator
+from typing import Literal, Generator, Sequence
 
 from dk64_lib.data_types import (
-    ActorGeometryData,
+    ActorModelData,
     AnimationCodeData,
     AnimationData,
     AutowalkData,
@@ -18,14 +20,15 @@ from dk64_lib.data_types import (
     DKTVInputData,
     ExitData,
     FloorCollisionData,
-    GeometryData,
     InstanceScriptData,
     MidiMusicData,
-    ModelTwoGeometryData,
+    ModelData,
     PathData,
+    PropModelData,
     RaceCheckpointData,
     SetupData,
     SpawnerData,
+    StageModelData,
     StubTableData,
     TextData,
     TextureData,
@@ -39,6 +42,7 @@ from dk64_lib.f3dex2.texture_export import (
     TextureImageFile,
     TexturedObjExporter,
     decode_texture,
+    display_list_mesh_groups,
     rgba_to_png,
 )
 from dk64_lib.constants import MAPS
@@ -73,6 +77,18 @@ RAW_EXPORT_TABLES = (
     26,
 )
 GUESSED_TEXTURE_TABLES = (7, 14, 25)
+PROP_TABLE = 4
+ACTOR_TABLE = 5
+GEOMETRY_TEXTURE_TABLE = 25
+ANIMATED_TEXTURE_TABLE = 7
+GEOMETRY_SAVE_METHODS = {
+    "obj": "save_to_obj",
+    "dae": "save_to_dae",
+    "gltf": "save_to_gltf",
+    "glb": "save_to_glb",
+}
+GeometryFormat = Literal["obj", "dae", "gltf", "glb"]
+GeometryFormats = GeometryFormat | Sequence[GeometryFormat]
 # Size guesses adapted from dk64-hacking-scripts' texture_size_guesser.py.
 TEXTURE_SIZE_GUESSES = {
     0x1000: (32, 64),
@@ -81,6 +97,19 @@ TEXTURE_SIZE_GUESSES = {
     0xAA0: (32, 44),
     0xF20: (44, 44),
 }
+
+
+def _geometry_formats(geometry_format: GeometryFormats) -> tuple[str, ...]:
+    formats = (
+        (geometry_format,)
+        if isinstance(geometry_format, str)
+        else tuple(geometry_format)
+    )
+    if not formats:
+        raise ValueError("geometry_format must name at least one format")
+    if set(formats) - GEOMETRY_SAVE_METHODS.keys():
+        raise ValueError("geometry_format must be 'obj', 'dae', 'gltf', or 'glb'")
+    return formats
 
 
 @dataclass(frozen=True)
@@ -197,7 +226,7 @@ class Rom:
         return [text_data for text_data in self.get_text_data()]
 
     @cached_property
-    def geometry_tables(self):
+    def stage_geometry_tables(self):
         return [geometry_data for geometry_data in self.get_geometry_data()]
 
     def export_textures(
@@ -221,21 +250,16 @@ class Rom:
         include_guessed: bool = True,
     ) -> tuple[TextureImageFile, ...]:
         """Create PNG images for texture entries with known or guessed metadata."""
-        display_lists = tuple(
+        mesh_groups = display_list_mesh_groups(
             display_list
-            for geometry_data in self.geometry_tables
+            for geometry_data in self.stage_geometry_tables
             if not geometry_data.is_pointer
             for display_list in geometry_data.display_lists
         )
         exporter = TexturedObjExporter(self.get_geometry_texture_data())
-        referenced_geometry_texture_indices = exporter.texture_image_indices(
-            display_lists
-        )
+        referenced_geometry_texture_indices = exporter.texture_image_indices(mesh_groups)
         images = list(
-            exporter.export_texture_images(
-                display_lists,
-                texture_folder=texture_folder,
-            )
+            exporter.export_texture_images(mesh_groups, texture_folder=texture_folder)
         )
         if include_guessed:
             images.extend(
@@ -318,31 +342,21 @@ class Rom:
             )
         return exported_paths
 
-    def export_geometries(
+    def export_stages(
         self,
-        folderpath: str | Path = "exports/geometries",
+        folderpath: str | Path = "exports/stages",
         include_textures: bool = True,
-        geometry_format: Literal["obj", "dae", "gltf", "glb"] = "glb",
+        geometry_format: GeometryFormats = "glb",
         animated_texture_frames: TextureAnimationFrames | None = None,
         animation_frame_duration: int = 4,
     ) -> list[Path]:
-        """Export geometry tables as GLB, OBJ, DAE, or glTF files."""
-        geometry_saver_names = {
-            "obj": "save_to_obj",
-            "dae": "save_to_dae",
-            "gltf": "save_to_gltf",
-            "glb": "save_to_glb",
-        }
-        try:
-            save_geometry_name = geometry_saver_names[geometry_format]
-        except KeyError:
-            raise ValueError("geometry_format must be 'obj', 'dae', 'gltf', or 'glb'")
-
+        """Export geometry tables as GLB, OBJ, DAE, or glTF files, or several at once."""
+        formats = _geometry_formats(geometry_format)
         exported_paths = list()
         root = Path(folderpath)
         root.mkdir(parents=True, exist_ok=True)
 
-        for geometry_index, geometry_data in enumerate(self.geometry_tables):
+        for geometry_index, geometry_data in enumerate(self.stage_geometry_tables):
             map_name = MAPS[geometry_index] if geometry_index < len(MAPS) else "unknown"
             filename_stem = self._safe_filename(f"{geometry_index:03d}_{map_name}")
 
@@ -353,24 +367,114 @@ class Rom:
                 )
                 continue
 
-            geometry_path = root / f"{filename_stem}.{geometry_format}"
-            save_geometry = getattr(geometry_data, save_geometry_name)
-            save_kwargs = {"include_textures": include_textures}
-            if geometry_format == "dae" and animated_texture_frames is not None:
-                save_kwargs.update(
-                    {
-                        "animated_texture_frames": animated_texture_frames,
-                        "animation_frame_duration": animation_frame_duration,
-                    }
+            for export_format in formats:
+                exported_paths.extend(
+                    self._save_model(
+                        geometry_data,
+                        root,
+                        filename_stem,
+                        include_textures,
+                        export_format,
+                        animated_texture_frames,
+                        animation_frame_duration,
+                    )
                 )
-            written_paths = save_geometry(
-                geometry_path.name,
-                str(root),
-                **save_kwargs,
-            )
-            exported_paths.extend(written_paths)
 
         return exported_paths
+
+    def export_actors(
+        self,
+        folderpath: str | Path = "exports/actors",
+        include_textures: bool = True,
+        geometry_format: GeometryFormats = "glb",
+    ) -> list[Path]:
+        return self._export_models(
+            self.actor_geometry_tables,
+            folderpath,
+            include_textures,
+            geometry_format,
+        )
+
+    def export_props(
+        self,
+        folderpath: str | Path = "exports/props",
+        include_textures: bool = True,
+        geometry_format: GeometryFormats = "glb",
+    ) -> list[Path]:
+        return self._export_models(
+            self.prop_geometry_tables,
+            folderpath,
+            include_textures,
+            geometry_format,
+        )
+
+    def _export_models(
+        self,
+        models: list[ModelData],
+        folderpath: str | Path,
+        include_textures: bool,
+        geometry_format: GeometryFormats,
+    ) -> list[Path]:
+        formats = _geometry_formats(geometry_format)
+        exported_paths = list()
+        root = Path(folderpath)
+        for model_data in models:
+            filename_stem = self._safe_filename(
+                f"{model_data.index:04X}_{model_data.name}"
+            )
+            model_root = root / filename_stem
+            exported_paths.append(
+                self._write_bytes(
+                    model_root / f"{filename_stem}.bin",
+                    model_data.raw_data,
+                )
+            )
+            for export_format in formats:
+                try:
+                    exported_paths.extend(
+                        self._save_model(
+                            model_data,
+                            model_root,
+                            filename_stem,
+                            include_textures,
+                            export_format,
+                        )
+                    )
+                except ValueError as error:
+                    exported_paths.append(
+                        self._write_text(
+                            model_root / f"{filename_stem}.error.txt",
+                            f"{error}\n",
+                        )
+                    )
+                    break
+        return exported_paths
+
+    def _save_model(
+        self,
+        model_data: StageModelData | ModelData,
+        root: Path,
+        filename_stem: str,
+        include_textures: bool,
+        geometry_format: GeometryFormat,
+        animated_texture_frames: TextureAnimationFrames | None = None,
+        animation_frame_duration: int = 4,
+    ) -> list[Path]:
+        save_model = getattr(model_data, GEOMETRY_SAVE_METHODS[geometry_format])
+        save_kwargs = {"include_textures": include_textures}
+        if geometry_format == "dae" and animated_texture_frames is not None:
+            save_kwargs.update(
+                {
+                    "animated_texture_frames": animated_texture_frames,
+                    "animation_frame_duration": animation_frame_duration,
+                }
+            )
+        root.mkdir(parents=True, exist_ok=True)
+        return save_model(
+            f"{filename_stem}.{geometry_format}",
+            str(root),
+            **save_kwargs,
+        )
 
     def export_assets(
         self,
@@ -407,7 +511,7 @@ class Rom:
         folderpath: str | Path = "exports",
         include_textures: bool = True,
         include_assets: bool = True,
-        geometry_format: Literal["obj", "dae", "gltf", "glb"] = "glb",
+        geometry_format: GeometryFormats = "glb",
         animated_texture_frames: TextureAnimationFrames | None = None,
         animation_frame_duration: int = 4,
     ) -> dict[str, list[Path]]:
@@ -425,9 +529,19 @@ class Rom:
                 }
             )
         exported = {
-            "geometries": self.export_geometries(
-                root / "geometries",
+            "stages": self.export_stages(
+                root / "stages",
                 **geometry_kwargs,
+            ),
+            "actors": self.export_actors(
+                root / "actors",
+                include_textures=include_textures,
+                geometry_format=geometry_format,
+            ),
+            "props": self.export_props(
+                root / "props",
+                include_textures=include_textures,
+                geometry_format=geometry_format,
             ),
             "textures": self.export_textures(root / "textures"),
             "text": self.export_text(root / "text"),
@@ -477,6 +591,7 @@ class Rom:
                 size=entry.size,
                 was_compressed=True if indic == 0x1F8B else False,
                 rom=self,
+                index=entry.index,
             )
 
     def generate_rom_table_data(self, tables: list[int]) -> Generator[dict, None, None]:
@@ -533,11 +648,19 @@ class Rom:
     def get_floor_collision_data(self) -> list[FloorCollisionData]:
         return self.get_stub_table_data(3)
 
-    def get_model_two_geometry_data(self) -> list[ModelTwoGeometryData]:
-        return self.get_stub_table_data(4)
+    @cached_property
+    def prop_geometry_tables(self) -> list[PropModelData]:
+        return [
+            PropModelData(**table_data)
+            for table_data in self.generate_rom_table_data([PROP_TABLE])
+        ]
 
-    def get_actor_geometry_data(self) -> list[ActorGeometryData]:
-        return self.get_stub_table_data(5)
+    @cached_property
+    def actor_geometry_tables(self) -> list[ActorModelData]:
+        return [
+            ActorModelData(**table_data)
+            for table_data in self.generate_rom_table_data([ACTOR_TABLE])
+        ]
 
     def get_setup_data(self) -> list[SetupData]:
         return self.get_stub_table_data(9)
@@ -582,12 +705,28 @@ class Rom:
         return self.get_stub_table_data(26)
 
     @cache
-    def get_geometry_texture_data(self) -> list[TextureData]:
-        """Fetch texture data referenced by map geometry display lists."""
-        return [
+    def get_geometry_texture_data(self) -> list[TextureData | None]:
+        """Fetch texture data referenced by all geometry display lists."""
+        return self._texture_table_data(GEOMETRY_TEXTURE_TABLE)
+
+    @cache
+    def get_animated_texture_data(self) -> list[TextureData | None]:
+        """Fetch the texture data referenced by animated textures."""
+        return self._texture_table_data(ANIMATED_TEXTURE_TABLE)
+
+    def _texture_table_data(self, table_id: int) -> list[TextureData | None]:
+        """Read a texture table indexed by it's entry number. If an entry is empty, 
+        it will be represented as None."""
+        textures = [
             TextureData(**table_data)
-            for table_data in self.generate_rom_table_data([25])
+            for table_data in self.generate_rom_table_data([table_id])
         ]
+        by_entry: list[TextureData | None] = [None] * (
+            max((texture.index for texture in textures), default=-1) + 1
+        )
+        for texture in textures:
+            by_entry[texture.index] = texture
+        return by_entry
 
     @cache
     def get_text_data(self) -> list[TextData]:
@@ -614,15 +753,15 @@ class Rom:
         return cutscene_data
 
     @cache
-    def get_geometry_data(self) -> list[GeometryData]:
+    def get_geometry_data(self) -> list[StageModelData]:
         """A function for fetching the cutscene data
 
         Yields:
-            list[GeometryData]: A list of texture data
+            list[StageModelData]: A list of texture data
         """
         geometry_data = list()
         for table_data in self.generate_rom_table_data([1]):
-            geometry_table = GeometryData(**table_data)
+            geometry_table = StageModelData(**table_data)
             geometry_data.append(geometry_table)
             if geometry_table.is_pointer:
                 geometry_table.points_to = geometry_data[geometry_table.pointer]

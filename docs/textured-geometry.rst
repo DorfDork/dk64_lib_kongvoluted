@@ -8,7 +8,10 @@ reference.
 
 The relevant implementation lives primarily in:
 
-* ``dk64_lib.data_types.geometry.GeometryData``
+* ``dk64_lib.data_types.geometry.StageModelData``
+* ``dk64_lib.data_types.geometry.ActorModelData``
+* ``dk64_lib.data_types.geometry.PropModelData``
+* ``dk64_lib.f3dex2.display_list.ModelDecoder``
 * ``dk64_lib.f3dex2.texture_export.TexturedObjExporter``
 * ``dk64_lib.f3dex2.texture_export.TexturedGltfExporter``
 * ``dk64_lib.f3dex2.texture_export.TexturedDaeExporter``
@@ -22,39 +25,43 @@ High-Level Export Flow
 Textured geometry export starts at one of the high-level helpers:
 
 * ``Rom.export_all()``
-* ``Rom.export_geometries()``
-* ``GeometryData.save_to_obj()``
-* ``GeometryData.save_to_textured_obj()``
-* ``GeometryData.create_textured_obj()``
-* ``GeometryData.save_to_gltf()``
-* ``GeometryData.save_to_glb()``
-* ``GeometryData.create_textured_gltf()``
-* ``GeometryData.create_textured_glb()``
-* ``GeometryData.save_to_dae()``
-* ``GeometryData.create_textured_dae()``
+* ``Rom.export_stages()``
+* ``Rom.export_actors()``
+* ``Rom.export_props()``
+* ``save_to_obj()``
+* ``save_to_textured_obj()``, on stages only
+* ``create_textured_obj()``
+* ``save_to_gltf()``
+* ``save_to_glb()``
+* ``create_textured_gltf()``
+* ``create_textured_glb()``
+* ``save_to_dae()``
+* ``create_textured_dae()``
 
-Geometry exports include textures by default. ``Rom.export_geometries()`` and
-``Rom.export_all()`` write GLB files unless the caller selects another
-``geometry_format``. The explicit ``GeometryData.save_to_obj()``,
-``save_to_gltf()``, ``save_to_glb()``, and ``save_to_dae()`` helpers also keep
-``include_textures=True`` as their default.
+Geometry exports include textures by default. The ``Rom`` export helpers write
+GLB files unless the caller selects another ``geometry_format``. The explicit
+``save_to_obj()``, ``save_to_gltf()``, ``save_to_glb()``, and ``save_to_dae()``
+helpers also keep ``include_textures=True`` as their default.
 
 The export flow is:
 
-1. ``GeometryData`` parses a geometry table entry into display lists, vertex
+1. ``StageModelData`` parses a geometry table entry into display lists, vertex
    data, display-list chunk metadata, and expansion display lists.
-2. The matching ``GeometryData.create_textured_*`` helper fetches the geometry
-   texture table through ``rom.get_geometry_texture_data()``.
-3. ``TexturedObjExporter``, ``TexturedGltfExporter``, or
-   ``TexturedDaeExporter`` walks the geometry display lists, tracks the active
-   F3DEX2 texture state, and groups triangles by the texture that was active
-   when those triangles were emitted.
-4. The exporter writes OBJ text plus MTL text, glTF JSON plus binary data, a
-   GLB binary, or an in-memory DAE document, and the PNG files needed by the
-   materials.
+   ``ActorModelData`` and ``PropModelData`` read their display lists, vertex
+   data, and actor bones.
+2. The matching ``create_textured_*`` helper fetches the geometry texture table
+   through ``rom.get_geometry_texture_data()``, plus the animated texture table
+   for props.
+3. Stages walk their display lists with ``display_list_mesh_groups()``, and
+   actors and props with ``ModelDecoder``. Both track the active F3DEX2 texture
+   state and group triangles by the texture that was active when those
+   triangles were emitted. ``TexturedObjExporter``, ``TexturedGltfExporter``,
+   or ``TexturedDaeExporter`` then exports those mesh groups.
+4. The exporter writes OBJ text plus MTL text, glTF JSON, a GLB binary, or an
+   in-memory DAE document, and the PNG files needed by the materials.
 5. ``save_textured_obj_export()`` writes the OBJ, MTL, and PNG files to disk.
-   ``save_textured_gltf_export()`` writes the glTF, binary buffer, and PNG
-   files. ``save_textured_glb_export()`` writes the GLB file.
+   ``save_textured_gltf_export()`` writes the glTF file.
+   ``save_textured_glb_export()`` writes the GLB file.
    ``save_textured_dae_export()`` writes the DAE and PNG files.
 
 The production geometry exporters do not write packed mipmap base/reference
@@ -120,8 +127,8 @@ Mesh Grouping
 -------------
 
 OBJ files are easier to import when faces that share a material are grouped
-together. ``TexturedObjExporter`` therefore creates internal mesh groups while
-walking each display list.
+together. The display-list walkers therefore create mesh groups which every
+exporter uses and shares.
 
 Groups are split when:
 
@@ -131,7 +138,8 @@ Groups are split when:
 
 The current triangle path handles ``G_TRI1`` and ``G_TRI2``. ``G_TRI2`` expands
 to two triangles. Faces emitted while no texture is active are still exported,
-but they do not receive ``vt`` coordinates or a ``usemtl`` statement.
+but they do not receive ``vt`` coordinates and use an untextured
+``vertex-material``.
 
 Vertex Output and Vertex Colors
 -------------------------------
@@ -237,10 +245,10 @@ Important details:
 * OBJ and DAE invert the vertical texture axis to match those importer
   conventions. glTF and GLB keep the source vertical axis because Blender's
   glTF importer applies the expected image orientation for that format.
-* Texture width and height come from the active ``G_SETTILESIZE`` command, not
-  from the raw byte count.
-* ``G_TEXTURE`` scale values are parsed by the command class but are not applied
-  by OBJ, glTF, GLB, or DAE export today.
+* Stage texture width and height come from the active ``G_SETTILESIZE``
+  command, not from the raw byte count.
+* ``G_TEXTURE`` scale values, tile shifts, and tile origins are only applied to
+  actor and prop UVs. ``G_TEXTURE_GEN`` generates their UVs from the normal.
 
 If a vertex has ``texture_cord_u = texture_width * 32`` then it maps to
 ``u = 1.0``. If it has ``texture_cord_v = texture_height * 32`` then it maps to
@@ -259,10 +267,13 @@ Each mesh group writes:
 
 * a comment identifying the mesh group and display-list offset;
 * ``v`` lines for all vertices, including RGB vertex colors;
+* ``vn`` lines when the group is lit;
 * ``vt`` lines when the group has an active texture;
-* ``usemtl`` before textured faces;
+* ``usemtl`` before its faces;
 * ``f`` lines using ``vertex_index/texture_index`` pairs for textured faces;
 * plain ``f`` lines for untextured faces.
+
+Lit groups add ``-lit`` to the material name, and culled groups add ``-culled``.
 
 The MTL file creates one material per unique texture key:
 
@@ -331,33 +342,33 @@ referenced by ``map_d``.
 glTF and GLB Structure
 ----------------------
 
-``GeometryData.save_to_glb()`` writes single-file binary glTF. This is the
-preferred Blender-focused export path because the geometry, material
-description, binary buffers, and referenced texture PNGs are packaged into one
-``.glb`` file.
+``save_to_glb()`` writes single-file binary glTF. This is the preferred
+Blender-focused export path because the geometry, material description, binary
+buffers, and referenced texture PNGs are packaged into one ``.glb`` file.
 
-``GeometryData.save_to_gltf()`` writes separate glTF assets. It returns the
-paths written with the ``.gltf`` file first, the sidecar ``.bin`` buffer second,
-and texture PNG files after that. This form is useful when the JSON and texture
-files need to be inspected directly.
+``save_to_gltf()`` writes one self-contained ``.gltf`` file, with its buffer and
+texture PNGs embedded as a base64 data URI. This form is useful when the JSON
+needs to be inspected directly.
 
-The glTF/GLB exporter uses the same display-list traversal, mesh grouping,
-texture decoding, UV conversion, clamp handling, and packed mipmap detection as
-the OBJ exporter. The file structure is:
+The glTF/GLB exporter uses the same mesh groups, texture decoding, UV
+conversion, clamp handling, and packed mipmap detection as the OBJ exporter. The
+file structure is:
 
 * each mesh group becomes one glTF mesh and one scene node;
 * each mesh primitive contains ``POSITION``, ``COLOR_0``, and, when textured,
-  ``TEXCOORD_0`` attributes;
+  ``TEXCOORD_0`` attributes, plus ``NORMAL`` when the group is lit;
 * indices are written as unsigned integer accessors into the binary buffer;
 * each unique texture key becomes one glTF texture, image, and sampler, plus
   one or more materials when opaque and vertex-alpha groups need different
   blend modes;
-* materials use the ``KHR_materials_unlit`` extension because DK64 map textures
-  are closer to unlit game materials than to authored PBR materials;
+* unlit groups use the ``KHR_materials_unlit`` extension because DK64 map
+  textures are closer to unlit game materials than to authored PBR materials;
+* materials are double-sided unless the group culls faces or is blended;
 * the material base color texture references the highest-resolution decoded
   PNG;
-* transparent textures keep their alpha in the color PNG and set
-  ``alphaMode`` to ``BLEND``;
+* textures whose alpha is only ever fully transparent or fully opaque set
+  ``alphaMode`` to ``MASK``. Other transparent textures keep their alpha in the
+  color PNG and set ``alphaMode`` to ``BLEND``;
 * mesh groups with vertex alpha below full opacity also set ``alphaMode`` to
   ``BLEND`` so ``COLOR_0`` alpha can create DK64-style foliage and terrain
   fades even when the texture image itself is opaque;
@@ -367,32 +378,33 @@ the OBJ exporter. The file structure is:
 * clamped DK64 tile axes are written as glTF sampler ``wrapS`` and ``wrapT``
   values, using ``CLAMP_TO_EDGE`` for clamped axes and ``REPEAT`` otherwise.
 
-Separate ``.gltf`` export writes decoded packed mipmap levels beside the
-highest-resolution texture PNG, but only the highest-resolution image is
-referenced by the glTF material. ``.glb`` embeds the highest-resolution PNG
-needed by each material and does not add unreferenced mip images to the binary
-container.
+``.glb`` export also writes an actor's skeleton as a glTF skin. Each bone
+becomes a ``bone_<index>`` joint node, and each vertex is fully weighted to its
+bone.
 
-For batch exports, ``Rom.export_geometries(..., geometry_format="glb")`` writes
-``.glb`` files, and ``geometry_format="gltf"`` writes separate glTF assets.
-``Rom.export_all()`` accepts the same ``geometry_format`` option and passes it
-through to geometry export.
+``.gltf`` and ``.glb`` embed the highest-resolution PNG needed by each material
+and do not add unreferenced mip images to the file.
+
+For batch exports, ``geometry_format="glb"`` writes ``.glb`` files and
+``geometry_format="gltf"`` writes ``.gltf`` files. ``Rom.export_stages()``,
+``Rom.export_actors()``, ``Rom.export_props()``, and ``Rom.export_all()`` all
+accept this option.
 
 DAE Structure
 -------------
 
-``GeometryData.save_to_dae()`` writes textured DAE output by default. It returns
-the paths written, with the DAE file first and the companion PNG texture files
-after it. Pass ``include_textures=False`` to keep the legacy geometry-only DAE
-path.
+``save_to_dae()`` writes textured DAE output by default. It returns the paths
+written, with the DAE file first and the companion PNG texture files after it.
+Pass ``include_textures=False`` to keep the legacy geometry-only DAE path for
+stages.
 
-The textured DAE exporter uses the same display-list traversal, mesh grouping,
-texture decoding, UV conversion, clamp handling, and packed mipmap detection as
-the OBJ exporter. The file structure is different:
+The textured DAE exporter uses the same mesh groups, texture decoding, UV
+conversion, clamp handling, and packed mipmap detection as the OBJ exporter. The
+file structure is different:
 
 * each mesh group becomes one ``library_geometries`` entry;
 * each geometry contains aligned ``VERTEX``, ``COLOR``, and, when textured,
-  ``TEXCOORD`` sources;
+  ``TEXCOORD`` sources, plus a ``NORMAL`` source when the group is lit;
 * each textured triangle set binds its material symbol to the geometry
   ``TEXCOORD`` source through ``bind_vertex_input``;
 * each unique texture key becomes one DAE material and effect;
@@ -408,9 +420,10 @@ resolution image, but the DAE material references the highest-resolution PNG.
 That mirrors the OBJ path and avoids relying on importer-specific mipmap-chain
 extensions.
 
-For batch exports, ``Rom.export_geometries(..., geometry_format="dae")`` writes
-``.dae`` files instead of ``.obj`` files. ``Rom.export_all()`` accepts the same
-``geometry_format`` option and passes it through to geometry export.
+For batch exports, ``geometry_format="dae"`` writes ``.dae`` files.
+``Rom.export_stages()``, ``Rom.export_actors()``, ``Rom.export_props()``, and
+``Rom.export_all()`` accepts the same ``geometry_format`` option and passes 
+it through to geometry export.
 
 Animated DAE Texture Atlases
 ----------------------------
@@ -426,9 +439,9 @@ DAE preview like this:
 
 .. code-block:: python
 
-   rom.geometry_tables[1].save_to_dae(
+   rom.stage_geometry_tables[1].save_to_dae(
        "funkys_store.dae",
-       "dk64_export/geometries",
+       "dk64_export/stages",
        animated_texture_frames={31: range(31, 39)},
        animation_frame_duration=4,
    )
@@ -437,8 +450,8 @@ The same option is available on ROM-level DAE export:
 
 .. code-block:: python
 
-   rom.export_geometries(
-       "dk64_export/geometries",
+   rom.export_stages(
+       "dk64_export/stages",
        geometry_format="dae",
        animated_texture_frames={31: range(31, 39)},
        animation_frame_duration=4,
@@ -743,7 +756,9 @@ folders:
 .. code-block:: text
 
    exports/
-     geometries/
+     stages/
+     actors/
+     props/
      textures/
      text/
      cutscenes/
@@ -751,11 +766,12 @@ folders:
 
 Geometry exports use textured GLB output by default. Pass
 ``geometry_format="obj"``, ``geometry_format="gltf"``, or
-``geometry_format="dae"`` to ``Rom.export_geometries()`` or ``Rom.export_all()``
-to write another geometry format instead. ``Rom.export_textures()`` separately
-writes PNG files for geometry textures referenced by display lists. It uses the
-same texture-state reconstruction described on this page, so those PNGs have
-reliable dimensions from display-list format, size, palette, width, and height.
+``geometry_format="dae"`` to ``Rom.export_stages()``, ``Rom.export_actors()``,
+``Rom.export_props()``, or ``Rom.export_all()`` to write another geometry format
+instead. ``Rom.export_textures()`` separately writes PNG files for stage
+textures referenced by display lists. It uses the same texture-state
+reconstruction described on this page, so those PNGs have reliable dimensions
+from display-list format, size, palette, width, and height.
 For table 7, table 14, and unreferenced table 25 entries, ``Rom.export_textures()``
 also writes best-effort RGBA5551 PNGs when the decompressed byte length matches
 a known size guess. Guessed outputs include ``guess`` in their filenames. Use
@@ -805,8 +821,8 @@ The current exporter is intentionally conservative:
 * It does not write or reference mipmap chains in the MTL, glTF, GLB, or DAE
   material. The material references the highest-resolution decoded PNG because
   that is what normal importers expect.
-* It parses ``G_TEXTURE`` scale fields but does not currently apply them to OBJ,
-  glTF, GLB, or DAE UVs.
+* It parses ``G_TEXTURE`` scale fields but only applies them to actor and prop
+  UVs.
 * It does not auto-detect DK64 animated texture frame ranges. Animated DAE atlas
   export requires an explicit ``animated_texture_frames`` mapping.
 * It writes RGB vertex colors to OBJ but does not write vertex alpha.

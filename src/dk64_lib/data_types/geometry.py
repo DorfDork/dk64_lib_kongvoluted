@@ -1,18 +1,33 @@
+from __future__ import annotations
+
 import re
 import pathlib
 
+from functools import cached_property
+from typing import ClassVar
+
 from numpy import array as numpy_array
-from collada import Collada, source, material, geometry, scene
+
+try:
+    from collada import Collada, source, material, geometry, scene
+except ImportError:
+    Collada = source = material = geometry = scene = None
 
 from dk64_lib.binary_reader import BinaryReader
+from dk64_lib.constants import ACTORS, MAPS, PROPS
 from dk64_lib.data_types.base import BaseData
 from dk64_lib.f3dex2.display_list import (
     DisplayList,
     DisplayListChunkData,
     DisplayListExpansion,
+    _MeshGroup,
+    ModelBone,
+    ModelDecoder,
     create_display_lists,
+    read_bones,
 )
 from dk64_lib.f3dex2.texture_export import (
+    DecodedTexture,
     TextureAnimationFrames,
     TexturedDaeExport,
     TexturedDaeExporter,
@@ -21,6 +36,7 @@ from dk64_lib.f3dex2.texture_export import (
     TexturedGltfExporter,
     TexturedObjExport,
     TexturedObjExporter,
+    display_list_mesh_groups,
     save_textured_dae_export,
     save_textured_glb_export,
     save_textured_gltf_export,
@@ -29,7 +45,141 @@ from dk64_lib.f3dex2.texture_export import (
 
 POINTER_PATTERN = re.compile(b'\x00[\x00-\xFF]\x08\x00\x00\x00\x00\x00')
 
-class GeometryData(BaseData):
+ACTOR_HEADER_SIZE = 0x28
+ACTOR_RAW_BASE = 0x00
+ACTOR_DISPLAY_LIST_TABLE = 0x04
+ACTOR_BONE_TABLE = 0x08
+ACTOR_TEXTURE_ANIMATIONS = 0x10
+ACTOR_BONE_COUNT = 0x20
+ACTOR_DISPLAY_LIST_COUNT = 0x21
+ACTOR_DATA_SEGMENT = 0x03
+
+PROP_CATEGORY = 0x0C
+PROP_MODEL_TYPE = 0x1C
+PROP_DISPLAY_LIST_1 = 0x40
+PROP_DISPLAY_LIST_2 = 0x44
+PROP_VERTEX_SEGMENT_BASE = 0x48
+PROP_TEXTURE_ANIMATIONS = 0x6C
+PROP_TEXTURE_ANIMATION_SIZE = 0x84
+PROP_GEOMETRY_TYPE = 1
+PROP_VERTEX_SEGMENT = 0x08
+
+
+class TexturedModelData(BaseData):
+    @property
+    def mesh_groups(self) -> tuple[_MeshGroup, ...]:
+        raise NotImplementedError
+
+    @property
+    def bones(self) -> tuple[ModelBone, ...]:
+        return tuple()
+
+    def _texture_tables(self) -> tuple[tuple[object, ...], ...]:
+        if self.rom is None:
+            return (tuple(),)
+        return (self.rom.get_geometry_texture_data(), self.rom.get_animated_texture_data())
+
+    def decode(self) -> tuple[tuple[_MeshGroup, ...], tuple[DecodedTexture, ...]]:
+        return TexturedObjExporter(*self._texture_tables()).decode(self.mesh_groups)
+
+    def create_textured_obj(
+        self,
+        mtl_filename: str = "model.mtl",
+        texture_folder: str = "textures",
+        include_textures: bool = True,
+    ) -> TexturedObjExport:
+        """Creates OBJ, MTL, and texture image data for this geometry."""
+        return TexturedObjExporter(*self._texture_tables()).export(
+            self.mesh_groups,
+            mtl_filename=mtl_filename,
+            texture_folder=texture_folder,
+            include_textures=include_textures,
+        )
+
+    def create_textured_dae(
+        self,
+        texture_folder: str = "textures",
+        animated_texture_frames: TextureAnimationFrames | None = None,
+        animation_frame_duration: int = 4,
+        include_textures: bool = True,
+    ) -> TexturedDaeExport:
+        """Creates DAE and texture image data for this geometry."""
+        return TexturedDaeExporter(*self._texture_tables()).export(
+            self.mesh_groups,
+            texture_folder=texture_folder,
+            animated_texture_frames=animated_texture_frames,
+            animation_frame_duration=animation_frame_duration,
+            include_textures=include_textures,
+        )
+
+    def create_textured_gltf(self, include_textures: bool = True) -> TexturedGltfExport:
+        """Creates self-contained glTF data for this geometry."""
+        return TexturedGltfExporter(*self._texture_tables()).export(
+            self.mesh_groups,
+            include_textures=include_textures,
+        )
+
+    def create_textured_glb(self, include_textures: bool = True) -> TexturedGlbExport:
+        """Creates binary glTF data for this geometry."""
+        return TexturedGltfExporter(*self._texture_tables()).export_glb(
+            self.mesh_groups,
+            include_textures=include_textures,
+            skeleton=self.bones,
+        )
+
+    def save_to_obj(
+        self,
+        filename: str,
+        folderpath: str = ".",
+        include_textures: bool = True,
+        texture_folder: str = "textures",
+    ) -> list[pathlib.Path]:
+        export = self.create_textured_obj(
+            mtl_filename=pathlib.Path(filename).with_suffix(".mtl").name,
+            texture_folder=texture_folder,
+            include_textures=include_textures,
+        )
+        return save_textured_obj_export(export, filename, folderpath)
+
+    def save_to_dae(
+        self,
+        filename: str,
+        folderpath: str = ".",
+        include_textures: bool = True,
+        texture_folder: str = "textures",
+        animated_texture_frames: TextureAnimationFrames | None = None,
+        animation_frame_duration: int = 4,
+    ) -> list[pathlib.Path]:
+        export = self.create_textured_dae(
+            texture_folder=texture_folder,
+            animated_texture_frames=animated_texture_frames,
+            animation_frame_duration=animation_frame_duration,
+            include_textures=include_textures,
+        )
+        return save_textured_dae_export(export, filename, folderpath)
+
+    def save_to_gltf(
+        self,
+        filename: str,
+        folderpath: str = ".",
+        include_textures: bool = True,
+    ) -> list[pathlib.Path]:
+        """Save geometry data to glTF format."""
+        export = self.create_textured_gltf(include_textures=include_textures)
+        return save_textured_gltf_export(export, filename, folderpath)
+
+    def save_to_glb(
+        self,
+        filename: str,
+        folderpath: str = ".",
+        include_textures: bool = True,
+    ) -> list[pathlib.Path]:
+        """Save geometry data to binary glTF format."""
+        export = self.create_textured_glb(include_textures=include_textures)
+        return save_textured_glb_export(export, filename, folderpath)
+
+
+class StageModelData(TexturedModelData):
     def __post_init__(self):
         self.data_type = "Geometry"
         self.is_pointer = False
@@ -65,6 +215,10 @@ class GeometryData(BaseData):
         self.vert_chunk_length = _unknown_start - self.vert_chunk_start
 
         self.dl_expansion_start = reader.read_u32(0x70)
+
+    @property
+    def name(self) -> str:
+        return MAPS[self.index] if self.index < len(MAPS) else "unknown"
 
     @property
     def pointer(self):
@@ -134,6 +288,10 @@ class GeometryData(BaseData):
             expansions=self.dl_expansions,
         )
 
+    @property
+    def mesh_groups(self) -> tuple[_MeshGroup, ...]:
+        return display_list_mesh_groups(self.display_lists)
+
     def create_obj(self) -> str:
         """Creates an obj file out of the geometry data
 
@@ -176,64 +334,6 @@ class GeometryData(BaseData):
                 # Display Lists reading them with local positions
                 tri_offset += len(verticies)
         return obj_data
-
-    def create_textured_obj(
-        self,
-        mtl_filename: str = "geometry.mtl",
-        texture_folder: str = "textures",
-    ) -> TexturedObjExport:
-        """Creates OBJ, MTL, and texture image data for this geometry."""
-        texture_data = self.rom.get_geometry_texture_data() if self.rom else tuple()
-        exporter = TexturedObjExporter(texture_data)
-        return exporter.export(
-            self.display_lists,
-            mtl_filename=mtl_filename,
-            texture_folder=texture_folder,
-        )
-
-    def create_textured_dae(
-        self,
-        texture_folder: str = "textures",
-        animated_texture_frames: TextureAnimationFrames | None = None,
-        animation_frame_duration: int = 4,
-    ) -> TexturedDaeExport:
-        """Creates DAE and texture image data for this geometry."""
-        texture_data = self.rom.get_geometry_texture_data() if self.rom else tuple()
-        exporter = TexturedDaeExporter(texture_data)
-        return exporter.export(
-            self.display_lists,
-            texture_folder=texture_folder,
-            animated_texture_frames=animated_texture_frames,
-            animation_frame_duration=animation_frame_duration,
-        )
-
-    def create_textured_gltf(
-        self,
-        binary_filename: str = "geometry.bin",
-        texture_folder: str = "textures",
-        include_textures: bool = True,
-    ) -> TexturedGltfExport:
-        """Creates glTF, binary, and texture image data for this geometry."""
-        texture_data = self.rom.get_geometry_texture_data() if self.rom else tuple()
-        exporter = TexturedGltfExporter(texture_data)
-        return exporter.export(
-            self.display_lists,
-            binary_filename=binary_filename,
-            texture_folder=texture_folder,
-            include_textures=include_textures,
-        )
-
-    def create_textured_glb(
-        self,
-        include_textures: bool = True,
-    ) -> TexturedGlbExport:
-        """Creates binary glTF data for this geometry."""
-        texture_data = self.rom.get_geometry_texture_data() if self.rom else tuple()
-        exporter = TexturedGltfExporter(texture_data)
-        return exporter.export_glb(
-            self.display_lists,
-            include_textures=include_textures,
-        )
 
     def save_to_obj(
         self,
@@ -296,6 +396,8 @@ class GeometryData(BaseData):
 
     def _create_geometry_only_dae(self) -> Collada:
         """Creates a DAE file with geometry and vertex colors only."""
+        if Collada is None:
+            raise ImportError("DAE export needs pycollada")
         mesh = Collada()
         
         vertex_data = list()
@@ -386,28 +488,160 @@ class GeometryData(BaseData):
         self._create_geometry_only_dae().write(filepath)
         return [filepath]
 
-    def save_to_gltf(
-        self,
-        filename: str,
-        folderpath: str = ".",
-        include_textures: bool = True,
-        texture_folder: str = "textures",
-    ) -> list[pathlib.Path]:
-        """Save geometry data to glTF format."""
-        binary_filename = pathlib.Path(filename).with_suffix(".bin").name
-        export = self.create_textured_gltf(
-            binary_filename=binary_filename,
-            texture_folder=texture_folder,
-            include_textures=include_textures,
-        )
-        return save_textured_gltf_export(export, filename, folderpath)
 
-    def save_to_glb(
-        self,
-        filename: str,
-        folderpath: str = ".",
-        include_textures: bool = True,
-    ) -> list[pathlib.Path]:
-        """Save geometry data to binary glTF format."""
-        export = self.create_textured_glb(include_textures=include_textures)
-        return save_textured_glb_export(export, filename, folderpath)
+class ModelData(TexturedModelData):
+    kind: ClassVar[str] = "model"
+
+    def __post_init__(self):
+        self.data_type = self.kind.capitalize()
+        self._reader = BinaryReader(self.raw_data)
+
+    @property
+    def bones(self) -> tuple[ModelBone, ...]:
+        return tuple(self._decoder.bones)
+
+    @property
+    def mesh_groups(self) -> tuple[_MeshGroup, ...]:
+        return self._decoder.mesh_groups
+
+    @cached_property
+    def _decoder(self) -> ModelDecoder:
+        decoder = self._decode()
+        if not decoder.mesh_groups:
+            raise ValueError("No triangles in the model's display lists")
+        return decoder
+
+    def _decode(self) -> ModelDecoder:
+        raise NotImplementedError
+
+
+class ActorModelData(ModelData):
+    kind = "actor"
+
+    @property
+    def name(self) -> str:
+        if self.index < len(ACTORS):
+            return ACTORS[self.index]
+        return self.kind
+
+    @property
+    def bone_count(self) -> int:
+        return self._reader.read_u8(ACTOR_BONE_COUNT)
+
+    def _decode(self) -> ModelDecoder:
+        if len(self.raw_data) < ACTOR_HEADER_SIZE:
+            raise ValueError("File is too small for an actor header")
+        raw_base = self._reader.read_u32(ACTOR_RAW_BASE)
+
+        def raw_to_offset(pointer: int) -> int:
+            return pointer + ACTOR_HEADER_SIZE - raw_base
+
+        def resolve_address(address: int) -> int | None:
+            if address >> 24 == ACTOR_DATA_SEGMENT:
+                return ACTOR_HEADER_SIZE + (address & 0xFFFFFF)
+            offset = raw_to_offset(address)
+            if address >> 24 == 0 or 0 <= offset < len(self.raw_data):
+                return offset
+            return None
+
+        bones = self._bones(raw_to_offset)
+        decoder = ModelDecoder(
+            self.raw_data,
+            resolve_address,
+            bones=bones,
+            texture_segments=self._texture_segments(raw_to_offset),
+        )
+        table = raw_to_offset(self._reader.read_u32(ACTOR_DISPLAY_LIST_TABLE))
+        for entry in range(self._reader.read_u8(ACTOR_DISPLAY_LIST_COUNT)):
+            offset = table + entry * 4
+            if 0 <= offset and offset + 4 <= len(self.raw_data):
+                decoder.walk(raw_to_offset(self._reader.read_u32(offset)))
+        return decoder
+
+    def _bones(self, raw_to_offset) -> list[ModelBone]:
+        pointer = self._reader.read_u32(ACTOR_BONE_TABLE)
+        if pointer == 0:
+            return list()
+        return read_bones(self.raw_data, raw_to_offset(pointer), self.bone_count)
+
+    def _texture_segments(self, raw_to_offset) -> dict[int, int]:
+        pointer = self._reader.read_u32(ACTOR_TEXTURE_ANIMATIONS)
+        if pointer == 0:
+            return dict()
+        offset = raw_to_offset(pointer)
+        if not 0 <= offset <= len(self.raw_data) - 2:
+            return dict()
+
+        count = self._reader.read_u16(offset)
+        offset += 2
+        segments = dict()
+        for _ in range(count):
+            if offset + 6 > len(self.raw_data):
+                break
+            frame_count = self._reader.read_u16(offset)
+            segment = self._reader.read_u16(offset + 2)
+            offset += 6
+            if frame_count == 0 or offset + frame_count * 2 > len(self.raw_data):
+                break
+            segments[segment] = self._reader.read_u16(offset)
+            offset += frame_count * 2
+        return segments
+
+
+class PropModelData(ModelData):
+    kind = "prop"
+
+    @property
+    def name(self) -> str:
+        name = PROPS[self.index] if self.index < len(PROPS) else ""
+        return " ".join(part for part in (self.category, name) if part) or self.kind
+
+    @property
+    def category(self) -> str:
+        raw_name = self.raw_data[PROP_CATEGORY:PROP_MODEL_TYPE].split(b"\0")[0]
+        if raw_name and all(0x20 <= character < 0x7F for character in raw_name):
+            return raw_name.decode("ascii")
+        return ""
+
+    @property
+    def model_type(self) -> int:
+        return self._reader.read_u8(PROP_MODEL_TYPE)
+
+    def _decode(self) -> ModelDecoder:
+        if len(self.raw_data) < PROP_TEXTURE_ANIMATIONS + 4:
+            raise ValueError("File is too small for a prop header")
+        if self.model_type != PROP_GEOMETRY_TYPE:
+            raise ValueError(f"Type {self.model_type} props are not geometry")
+        vertex_base = self._reader.read_u32(PROP_VERTEX_SEGMENT_BASE)
+
+        def resolve_address(address: int) -> int | None:
+            segment, offset = address >> 24, address & 0xFFFFFF
+            if segment == PROP_VERTEX_SEGMENT:
+                return vertex_base + offset
+            if segment == 0:
+                return offset
+            return None
+
+        decoder = ModelDecoder(
+            self.raw_data,
+            resolve_address,
+            fallback_textures=self._animated_textures(),
+        )
+        for display_list in (PROP_DISPLAY_LIST_1, PROP_DISPLAY_LIST_2):
+            offset = self._reader.read_u32(display_list)
+            if offset:
+                decoder.walk(offset)
+        return decoder
+
+    def _animated_textures(self) -> set[int]:
+        offset = self._reader.read_u32(PROP_TEXTURE_ANIMATIONS)
+        if offset + 4 > len(self.raw_data):
+            return set()
+
+        textures = set()
+        for entry in range(self._reader.read_u32(offset)):
+            start = offset + 4 + entry * PROP_TEXTURE_ANIMATION_SIZE
+            if start + PROP_TEXTURE_ANIMATION_SIZE > len(self.raw_data):
+                break
+            textures.add(self._reader.read_u32(start))
+        return textures

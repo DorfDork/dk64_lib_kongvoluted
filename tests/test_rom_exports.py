@@ -5,7 +5,7 @@ from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 
-from dk64_lib.data_types.geometry import GeometryData
+from dk64_lib.data_types.geometry import StageModelData
 from dk64_lib.f3dex2.display_list import DisplayList
 from dk64_lib.rom import Rom
 
@@ -173,31 +173,31 @@ class _FakeGeometry:
 class RomExportTest(unittest.TestCase):
     def test_export_defaults_include_textures(self):
         self.assertIs(
-            signature(GeometryData.save_to_obj)
+            signature(StageModelData.save_to_obj)
             .parameters["include_textures"]
             .default,
             True,
         )
         self.assertIs(
-            signature(GeometryData.save_to_dae)
+            signature(StageModelData.save_to_dae)
             .parameters["include_textures"]
             .default,
             True,
         )
         self.assertIs(
-            signature(GeometryData.save_to_gltf)
+            signature(StageModelData.save_to_gltf)
             .parameters["include_textures"]
             .default,
             True,
         )
         self.assertIs(
-            signature(GeometryData.save_to_glb)
+            signature(StageModelData.save_to_glb)
             .parameters["include_textures"]
             .default,
             True,
         )
         self.assertIs(
-            signature(Rom.export_geometries)
+            signature(Rom.export_stages)
             .parameters["include_textures"]
             .default,
             True,
@@ -207,7 +207,7 @@ class RomExportTest(unittest.TestCase):
             True,
         )
         self.assertEqual(
-            signature(Rom.export_geometries)
+            signature(Rom.export_stages)
             .parameters["geometry_format"]
             .default,
             "glb",
@@ -229,13 +229,13 @@ class RomExportTest(unittest.TestCase):
     def test_export_geometries_writes_glbs_by_default_and_pointer_files(self):
         rom = _fake_rom()
         geometry = _FakeGeometry()
-        rom.geometry_tables = [
+        rom.stage_geometry_tables = [
             geometry,
             SimpleNamespace(is_pointer=True, pointer=0),
         ]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            paths = Rom.export_geometries(rom, tmpdir)
+            paths = Rom.export_stages(rom, tmpdir)
             root = Path(tmpdir)
 
             glb_path = root / "000_Test_Map.glb"
@@ -250,10 +250,10 @@ class RomExportTest(unittest.TestCase):
     def test_export_geometries_can_skip_textures(self):
         rom = _fake_rom()
         geometry = _FakeGeometry()
-        rom.geometry_tables = [geometry]
+        rom.stage_geometry_tables = [geometry]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            paths = Rom.export_geometries(rom, tmpdir, include_textures=False)
+            paths = Rom.export_stages(rom, tmpdir, include_textures=False)
             root = Path(tmpdir)
 
             self.assertEqual(paths, [root / "000_Test_Map.glb"])
@@ -263,10 +263,10 @@ class RomExportTest(unittest.TestCase):
     def test_export_geometries_can_write_obj(self):
         rom = _fake_rom()
         geometry = _FakeGeometry()
-        rom.geometry_tables = [geometry]
+        rom.stage_geometry_tables = [geometry]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            paths = Rom.export_geometries(rom, tmpdir, geometry_format="obj")
+            paths = Rom.export_stages(rom, tmpdir, geometry_format="obj")
             root = Path(tmpdir)
 
             obj_path = root / "000_Test_Map.obj"
@@ -282,10 +282,10 @@ class RomExportTest(unittest.TestCase):
     def test_export_geometries_can_write_dae(self):
         rom = _fake_rom()
         geometry = _FakeGeometry()
-        rom.geometry_tables = [geometry]
+        rom.stage_geometry_tables = [geometry]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            paths = Rom.export_geometries(rom, tmpdir, geometry_format="dae")
+            paths = Rom.export_stages(rom, tmpdir, geometry_format="dae")
             root = Path(tmpdir)
 
             dae_path = root / "000_Test_Map.dae"
@@ -299,10 +299,10 @@ class RomExportTest(unittest.TestCase):
     def test_export_geometries_can_write_gltf(self):
         rom = _fake_rom()
         geometry = _FakeGeometry()
-        rom.geometry_tables = [geometry]
+        rom.stage_geometry_tables = [geometry]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            paths = Rom.export_geometries(rom, tmpdir, geometry_format="gltf")
+            paths = Rom.export_stages(rom, tmpdir, geometry_format="gltf")
             root = Path(tmpdir)
 
             gltf_path = root / "000_Test_Map.gltf"
@@ -318,10 +318,10 @@ class RomExportTest(unittest.TestCase):
     def test_export_geometries_can_write_glb(self):
         rom = _fake_rom()
         geometry = _FakeGeometry()
-        rom.geometry_tables = [geometry]
+        rom.stage_geometry_tables = [geometry]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            paths = Rom.export_geometries(rom, tmpdir, geometry_format="glb")
+            paths = Rom.export_stages(rom, tmpdir, geometry_format="glb")
             root = Path(tmpdir)
 
             glb_path = root / "000_Test_Map.glb"
@@ -332,10 +332,50 @@ class RomExportTest(unittest.TestCase):
 
     def test_export_geometries_rejects_unknown_format(self):
         rom = _fake_rom()
-        rom.geometry_tables = []
+        rom.stage_geometry_tables = []
 
         with self.assertRaisesRegex(ValueError, "geometry_format"):
-            Rom.export_geometries(rom, geometry_format="fbx")
+            Rom.export_stages(rom, geometry_format="fbx")
+
+    def test_export_geometries_can_write_several_formats_at_once(self):
+        rom = _fake_rom()
+        geometry = _FakeGeometry()
+        rom.stage_geometry_tables = [geometry]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = Rom.export_stages(rom, tmpdir, geometry_format=("glb", "dae"))
+            root = Path(tmpdir)
+
+            self.assertIn(root / "000_Test_Map.glb", paths)
+            self.assertIn(root / "000_Test_Map.dae", paths)
+            self.assertNotIn(root / "000_Test_Map.obj", paths)
+            self.assertFalse((root / "000_Test_Map.obj").exists())
+
+    def test_export_geometries_writes_only_glb_without_a_format(self):
+        rom = _fake_rom()
+        geometry = _FakeGeometry()
+        rom.stage_geometry_tables = [geometry]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = Rom.export_stages(rom, tmpdir)
+            root = Path(tmpdir)
+
+            self.assertEqual(paths, [root / "000_Test_Map.glb"])
+            for geometry_format in ("obj", "dae", "gltf"):
+                self.assertFalse((root / f"000_Test_Map.{geometry_format}").exists())
+
+    def test_export_geometries_rejects_a_bad_format_before_writing_anything(self):
+        rom = _fake_rom()
+        geometry = _FakeGeometry()
+        rom.stage_geometry_tables = [geometry]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "geometry_format"):
+                Rom.export_stages(rom, tmpdir, geometry_format=("glb", "fbx"))
+            with self.assertRaisesRegex(ValueError, "at least one format"):
+                Rom.export_stages(rom, tmpdir, geometry_format=tuple())
+
+            self.assertEqual(list(Path(tmpdir).iterdir()), [])
 
     def test_export_text(self):
         rom = _fake_rom()
@@ -370,7 +410,7 @@ class RomExportTest(unittest.TestCase):
 
     def test_export_textures_writes_geometry_pngs(self):
         rom = _fake_rom()
-        rom.geometry_tables = [
+        rom.stage_geometry_tables = [
             SimpleNamespace(
                 is_pointer=False,
                 display_lists=[_textured_triangle_display_list()],
@@ -454,9 +494,19 @@ class RomExportTest(unittest.TestCase):
 
     def test_export_all_combines_supported_exports(self):
         rom = _fake_rom()
-        rom.export_geometries = (
+        rom.export_stages = (
             lambda folderpath, include_textures=True, geometry_format="glb": [
                 Path(folderpath) / f"textures_{include_textures}.{geometry_format}"
+            ]
+        )
+        rom.export_actors = (
+            lambda folderpath, include_textures=True, geometry_format="glb": [
+                Path(folderpath) / f"actor_{include_textures}.{geometry_format}"
+            ]
+        )
+        rom.export_props = (
+            lambda folderpath, include_textures=True, geometry_format="glb": [
+                Path(folderpath) / f"prop_{include_textures}.{geometry_format}"
             ]
         )
         rom.export_textures = lambda folderpath: [Path(folderpath) / "texture.png"]
@@ -476,7 +526,9 @@ class RomExportTest(unittest.TestCase):
             self.assertEqual(
                 exported,
                 {
-                    "geometries": [root / "geometries" / "textures_False.dae"],
+                    "stages": [root / "stages" / "textures_False.dae"],
+                    "actors": [root / "actors" / "actor_False.dae"],
+                    "props": [root / "props" / "prop_False.dae"],
                     "textures": [root / "textures" / "texture.png"],
                     "text": [root / "text" / "text.txt"],
                     "cutscenes": [root / "cutscenes" / "cutscene.bin"],

@@ -41,7 +41,7 @@ class ObjTest(unittest.TestCase):
         self.rom = get_rom()
 
     def test_map_objs(self):
-        for map_num, geometry_table in enumerate(self.rom.geometry_tables):
+        for map_num, geometry_table in enumerate(self.rom.stage_geometry_tables):
             with self.subTest(f"{map_num}.obj, {MAPS[map_num]}"):
                 try:
                     obj_data = get_obj_file_str(f"{map_num}.obj")
@@ -56,7 +56,7 @@ class ObjTest(unittest.TestCase):
                 )
 
     def test_create_obj_includes_vertex_colors(self):
-        obj_data = self.rom.geometry_tables[0].create_obj()
+        obj_data = self.rom.stage_geometry_tables[0].create_obj()
 
         self.assertIn("v 20 20 20 0.000000 0.000000 0.000000", obj_data)
 
@@ -286,7 +286,7 @@ class DisplayListTest(unittest.TestCase):
             215: []
         }
             
-        for geometry_pos, geometry in enumerate(self.rom.geometry_tables):
+        for geometry_pos, geometry in enumerate(self.rom.stage_geometry_tables):
             with self.subTest(f"Geometry {geometry_pos}"):
                 self.assertEqual(command_counts.get(geometry_pos), [dl.num_commands for dl in geometry.display_lists])
             

@@ -1,6 +1,6 @@
 dist/
 venv/
-dk64_lib.egg-info/
+*.egg-info/
 __pycache__/
 *.n64
 *.z64

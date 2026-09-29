@@ -16,7 +16,7 @@ Default output:
 .. code-block:: text
 
    dk64_export/
-     geometries/
+     stages/
      textures/
      text/
      cutscenes/
@@ -24,16 +24,31 @@ Default output:
 
 Set ``include_assets=False`` to skip raw asset table exports. Geometry export
 uses single-file binary glTF by default. Set ``geometry_format="gltf"`` for
-separate glTF JSON/binary/PNG assets, ``"obj"`` for legacy OBJ/MTL files, or
+self-contained glTF JSON, ``"obj"`` for legacy OBJ/MTL files, or
 ``"dae"`` for legacy COLLADA files. Set ``include_textures=False`` to write
 geometry without texture materials.
+
+You can pass several formats to ``geometry_format`` to write each model 
+format simultaneously.
+
+.. code-block:: python
+
+   rom.export_all("dk64_export", geometry_format=("glb", "dae"))
+
+``export_stages``, ``export_actors``, and ``export_props`` take the same
+argument. ``ValueError`` appear for unknown formats.
 
 Geometry
 --------
 
 .. code-block:: python
 
-   paths = rom.export_geometries("dk64_export/geometries")
+   paths = rom.export_stages("dk64_export/stages")
+   paths = rom.export_actors("dk64_export/actors")
+   paths = rom.export_props("dk64_export/props")
+
+All three take the same ``include_textures`` and ``geometry_format`` arguments
+and write the same formats.
 
 Textured GLB geometry export writes by default:
 
@@ -43,7 +58,7 @@ The default call is:
 
 .. code-block:: python
 
-   paths = rom.export_geometries("dk64_export/geometries")
+   paths = rom.export_stages("dk64_export/stages")
 
 Textured OBJ geometry export is selected with ``geometry_format="obj"``. It
 writes:
@@ -58,25 +73,21 @@ Textured glTF geometry export is selected with:
 
 .. code-block:: python
 
-   paths = rom.export_geometries(
-       "dk64_export/geometries",
+   paths = rom.export_stages(
+       "dk64_export/stages",
        geometry_format="gltf",
    )
 
 It writes:
 
 * ``###_<map_name>.gltf``
-* ``###_<map_name>.bin``
-* ``textures/<material_name>.png``
-* ``textures/<material_name>_mip<level>_<width>x<height>.png`` when packed
-  mipmap levels are decoded
 
 Textured DAE geometry export is selected with:
 
 .. code-block:: python
 
-   paths = rom.export_geometries(
-       "dk64_export/geometries",
+   paths = rom.export_stages(
+       "dk64_export/stages",
        geometry_format="dae",
    )
 
@@ -94,8 +105,8 @@ frames:
 
 .. code-block:: python
 
-   paths = rom.export_geometries(
-       "dk64_export/geometries",
+   paths = rom.export_stages(
+       "dk64_export/stages",
        geometry_format="dae",
        animated_texture_frames={31: range(31, 39)},
        animation_frame_duration=4,
@@ -115,6 +126,9 @@ Pointer entries are written as:
 
 The pointer file contains the target geometry table index.
 
+Actors and props are written in their individual folders sorted by file index
+with ``<ID>.bin`` their respective decompressed rom files.
+Models which cannot be decoded will get a ``<ID>.error.txt`` instead.
 OBJ exports include RGB vertex colors on ``v`` lines. GLB and glTF export
 linearized RGBA ``COLOR_0`` vertex colors, while DAE exports normalized RGBA
 vertex colors. Textured groups include UV coordinates and material bindings.

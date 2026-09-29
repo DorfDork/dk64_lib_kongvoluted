@@ -1,5 +1,11 @@
-from dataclasses import dataclass
+from __future__ import annotations
+
+import copy
+import math
+
+from dataclasses import dataclass, field, replace
 from tempfile import TemporaryFile
+from typing import Callable
 
 from dk64_lib.f3dex2.vertex import Vertex
 from dk64_lib.f3dex2.triangle import Triangle
@@ -431,3 +437,775 @@ def create_display_lists(
         return ret_list
 
     return read_display_lists()
+
+G_CULL_FRONT = 0x00000200
+G_CULL_BACK = 0x00000400
+G_FOG = 0x00010000
+G_LIGHTING = 0x00020000
+G_TEXTURE_GEN = 0x00040000
+G_TEXTURE_GEN_LINEAR = 0x00080000
+
+HILITE_SEGMENT = 0x05
+
+CYCLE_TYPE_SHIFT = 20
+CYCLE_TYPE_LENGTH = 2
+G_CYC_2CYCLE = 1
+
+CM_MIRROR = 0x1
+CM_CLAMP = 0x2
+
+_COLOR_A = ("COMBINED", "TEXEL0", "TEXEL1", "PRIMITIVE", "SHADE", "ENVIRONMENT", "1", "NOISE")
+_COLOR_B = ("COMBINED", "TEXEL0", "TEXEL1", "PRIMITIVE", "SHADE", "ENVIRONMENT", "CENTER", "K4")
+_COLOR_C = (
+    "COMBINED", "TEXEL0", "TEXEL1", "PRIMITIVE", "SHADE", "ENVIRONMENT", "SCALE",
+    "COMBINED_ALPHA", "TEXEL0_ALPHA", "TEXEL1_ALPHA", "PRIMITIVE_ALPHA", "SHADE_ALPHA",
+    "ENV_ALPHA", "LOD_FRACTION", "PRIM_LOD_FRAC", "K5",
+)
+_COLOR_D = ("COMBINED", "TEXEL0", "TEXEL1", "PRIMITIVE", "SHADE", "ENVIRONMENT", "1")
+_ALPHA_ABD = ("COMBINED", "TEXEL0", "TEXEL1", "PRIMITIVE", "SHADE", "ENVIRONMENT", "1")
+_ALPHA_C = (
+    "LOD_FRACTION", "TEXEL0", "TEXEL1", "PRIMITIVE", "SHADE", "ENVIRONMENT", "PRIM_LOD_FRAC"
+)
+
+CYCLE_FIELDS = ("A", "B", "C", "D", "A_alpha", "B_alpha", "C_alpha", "D_alpha")
+
+DEFAULT_CYCLE = ("TEXEL0", "0", "SHADE", "0", "TEXEL0", "0", "SHADE", "0")
+WHITE = (0xFF, 0xFF, 0xFF, 0xFF)
+
+
+def _mux(table: tuple[str, ...], value: int) -> str:
+    return table[value] if value < len(table) else "0"
+
+
+@dataclass(frozen=True, slots=True)
+class RenderState:
+    combiner: tuple[tuple[str, ...], tuple[str, ...]] = (DEFAULT_CYCLE, DEFAULT_CYCLE)
+    prim_color: tuple[int, int, int, int] = WHITE
+    env_color: tuple[int, int, int, int] = WHITE
+    lighting: bool = False
+    cull_front: bool = False
+    cull_back: bool = False
+    fog: bool = False
+    texture_gen: bool = False
+    texture_gen_linear: bool = False
+    hilite: bool = False
+    two_cycle: bool = False
+    mirror_s: bool = False
+    mirror_t: bool = False
+    mask_s: int = 0
+    mask_t: int = 0
+    shift_s: int = 0
+    shift_t: int = 0
+    other_mode_l: int = 0
+
+    @property
+    def alpha_reads_texture(self) -> bool:
+        cycles = self.combiner[: 2 if self.two_cycle else 1]
+        alpha_inputs = CYCLE_FIELDS.index("A_alpha")
+        return any(
+            name.startswith("TEXEL") for cycle in cycles for name in cycle[alpha_inputs:]
+        )
+
+
+def decode_combiner(
+    command: commands.G_SETCOMBINE | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if command is None:
+        return (DEFAULT_CYCLE, DEFAULT_CYCLE)
+    return tuple(
+        (
+            _mux(_COLOR_A, getattr(command, f"color_a_{cycle}")),
+            _mux(_COLOR_B, getattr(command, f"color_b_{cycle}")),
+            _mux(_COLOR_C, getattr(command, f"color_c_{cycle}")),
+            _mux(_COLOR_D, getattr(command, f"color_d_{cycle}")),
+            _mux(_ALPHA_ABD, getattr(command, f"alpha_a_{cycle}")),
+            _mux(_ALPHA_ABD, getattr(command, f"alpha_b_{cycle}")),
+            _mux(_ALPHA_C, getattr(command, f"alpha_c_{cycle}")),
+            _mux(_ALPHA_ABD, getattr(command, f"alpha_d_{cycle}")),
+        )
+        for cycle in (0, 1)
+    )
+
+
+def cycle_type_is_two(other_mode_h_data: int) -> bool:
+    cycle_mask = (1 << CYCLE_TYPE_LENGTH) - 1
+    return (other_mode_h_data >> CYCLE_TYPE_SHIFT) & cycle_mask == G_CYC_2CYCLE
+
+
+VERTEX_SIZE = 0x10
+
+
+@dataclass(frozen=True, slots=True)
+class _TextureKey:
+    image_index: int
+    palette_index: int | None
+    fmt: int
+    size: int
+    width: int
+    height: int
+    clamp_s: bool = False
+    clamp_t: bool = False
+    from_fallback_table: bool = False
+
+    @property
+    def material_name(self) -> str:
+        palette = "none" if self.palette_index is None else str(self.palette_index)
+        name = (
+            f"tex_{self.image_index}_pal_{palette}_"
+            f"f{self.fmt}_s{self.size}_{self.width}x{self.height}"
+        )
+        if self.clamp_s and self.clamp_t:
+            return f"{name}_clamp_st"
+        if self.clamp_s:
+            return f"{name}_clamp_s"
+        if self.clamp_t:
+            return f"{name}_clamp_t"
+        return name
+
+    @property
+    def image_filename(self) -> str:
+        return f"{self.material_name}.png"
+
+    @property
+    def byte_size(self) -> int:
+        return self.width * self.height * (4 << self.size) // 8
+
+
+@dataclass(frozen=True, slots=True)
+class _MeshGroup:
+    vertices: tuple[Vertex, ...]
+    triangles: tuple[Triangle, ...]
+    texture: _TextureKey | None
+    display_list_offset: int
+    translucent: bool = False
+    double_sided: bool = True
+    vertex_bones: tuple[int, ...] = tuple()
+    vertex_normals: tuple[tuple[float, float, float], ...] = tuple()
+    render: RenderState | None = None
+    optional_segment: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelBone:
+    index: int
+    parent: int
+    local: tuple[float, float, float]
+    world: tuple[float, float, float]
+    channel: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _ImageSource:
+    index: int
+    fmt: int
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TileDescriptor:
+    fmt: int
+    size: int
+    line: int
+    tmem: int
+    palette: int
+    clamp_s: bool
+    clamp_t: bool
+    mirror_s: bool = False
+    mirror_t: bool = False
+    mask_s: int = 0
+    mask_t: int = 0
+    shift_s: int = 0
+    shift_t: int = 0
+
+
+class _TextureState:
+    def __init__(self, prefer_loaded_dimensions: bool = False):
+        self._prefer_loaded_dimensions = prefer_loaded_dimensions
+        self._pending_image: _ImageSource | None = None
+        self._loaded_images: dict[int, _ImageSource] = {}
+        self._tile_descriptors: dict[int, _TileDescriptor] = {}
+        self._tile_rects: dict[int, commands.G_SETTILESIZE] = {}
+        self._loaded_bytes: dict[int, int] = {}
+        self._last_loaded_tile: int | None = None
+        self._last_palette: _ImageSource | None = None
+        self._active_tile: int | None = None
+        self._texture_tile = 0
+        self._texture_scale = (1.0, 1.0)
+        self._combine: commands.G_SETCOMBINE | None = None
+        self._prim_color = WHITE
+        self._env_color = WHITE
+        self._geometry_mode = 0
+        self._two_cycle = False
+        self._other_mode_l = 0
+        self._hilite = False
+
+    def clone(self) -> _TextureState:
+        state = copy.copy(self)
+        state._loaded_images = dict(self._loaded_images)
+        state._tile_descriptors = dict(self._tile_descriptors)
+        state._tile_rects = dict(self._tile_rects)
+        state._loaded_bytes = dict(self._loaded_bytes)
+        return state
+
+    def apply(self, command: commands.DL_Command) -> None:
+        if isinstance(command, commands.G_SETTIMG):
+            self._pending_image = _ImageSource(
+                index=command.address,
+                fmt=command.fmt,
+                size=command.size,
+            )
+            return
+
+        if isinstance(command, (commands.G_LOADBLOCK, commands.G_LOADTILE)):
+            loading = self._tile_descriptors.get(command.tile)
+            loading_bits = 4 << loading.size if loading else 16
+            if isinstance(command, commands.G_LOADBLOCK):
+                texels = command.texel_count
+            else:
+                texels = (abs(command.lrs - command.uls) // 4 + 1) * (
+                    abs(command.lrt - command.ult) // 4 + 1
+                )
+            self._loaded_bytes[command.tile] = texels * loading_bits // 8
+            if self._pending_image is not None:
+                self._loaded_images[command.tile] = self._pending_image
+                self._last_loaded_tile = command.tile
+            return
+
+        if isinstance(command, commands.G_LOADTLUT):
+            if self._pending_image is not None:
+                self._last_palette = self._pending_image
+            return
+
+        if isinstance(command, commands.G_SETTILE):
+            self._tile_descriptors[command.tile] = _TileDescriptor(
+                fmt=command.fmt,
+                size=command.size,
+                line=command.line,
+                tmem=command.tmem,
+                palette=command.palette,
+                clamp_s=bool(command.cm_s & CM_CLAMP),
+                clamp_t=bool(command.cm_t & CM_CLAMP),
+                mirror_s=bool(command.cm_s & CM_MIRROR),
+                mirror_t=bool(command.cm_t & CM_MIRROR),
+                mask_s=command.mask_s,
+                mask_t=command.mask_t,
+                shift_s=command.shift_s,
+                shift_t=command.shift_t,
+            )
+            return
+
+        if isinstance(command, commands.G_SETTILESIZE):
+            if self._active_tile is None:
+                self._active_tile = command.tile
+            self._tile_rects[command.tile] = command
+            self._hilite = False
+            return
+
+        if isinstance(command, commands.G_DL):
+            if command.segment[0] == HILITE_SEGMENT and command.store_return_address:
+                self._hilite = True
+            return
+
+        if isinstance(command, commands.G_TEXTURE):
+            self._active_tile = command.tile if command.on else None
+            self._texture_tile = command.tile
+            self._texture_scale = tuple(
+                1.0 if scale == 0xFFFF else scale / 0x10000
+                for scale in (command.scale_s, command.scale_t)
+            )
+            return
+
+        if isinstance(command, commands.G_SETCOMBINE):
+            self._combine = command
+            return
+
+        if isinstance(command, commands.G_SETPRIMCOLOR):
+            self._prim_color = (command.r, command.g, command.b, command.a)
+            return
+
+        if isinstance(command, commands.G_SETENVCOLOR):
+            self._env_color = (command.r, command.g, command.b, command.a)
+            return
+
+        if isinstance(command, commands.G_GEOMETRYMODE):
+            self._geometry_mode = (
+                self._geometry_mode & ~command.clear_bits
+            ) | command.set_bits
+            return
+
+        if isinstance(command, commands.G_SetOtherMode_H):
+            if command.shift == CYCLE_TYPE_SHIFT:
+                self._two_cycle = cycle_type_is_two(command.data)
+            return
+
+        if isinstance(command, commands.G_SetOtherMode_L):
+            mask = ((1 << command.length) - 1) << command.shift
+            self._other_mode_l = (self._other_mode_l & ~mask) | (command.data & mask)
+
+    @property
+    def geometry_mode(self) -> int:
+        return self._geometry_mode
+
+    @property
+    def other_mode_l(self) -> int:
+        return self._other_mode_l
+
+    @property
+    def texture_tile(self) -> int:
+        return self._texture_tile
+
+    @property
+    def texture_scale(self) -> tuple[float, float]:
+        return self._texture_scale
+
+    @property
+    def texture_tile_shift(self) -> tuple[int, int]:
+        descriptor = self._tile_descriptors.get(self._texture_tile)
+        return (descriptor.shift_s, descriptor.shift_t) if descriptor else (0, 0)
+
+    @property
+    def texture_tile_origin(self) -> tuple[int, int]:
+        rect = self._tile_rects.get(self._texture_tile)
+        return (rect.uls, rect.ult) if rect else (0, 0)
+
+    @property
+    def combiner_reads_texture(self) -> bool:
+        cycles = decode_combiner(self._combine)[: 2 if self._two_cycle else 1]
+        return any(name.startswith("TEXEL") for cycle in cycles for name in cycle)
+
+    @property
+    def render_state(self) -> RenderState:
+        tile = self._tile_descriptors.get(self._active_tile)
+        return RenderState(
+            combiner=decode_combiner(self._combine),
+            prim_color=self._prim_color,
+            env_color=self._env_color,
+            lighting=bool(self._geometry_mode & G_LIGHTING),
+            cull_front=bool(self._geometry_mode & G_CULL_FRONT),
+            cull_back=bool(self._geometry_mode & G_CULL_BACK),
+            fog=bool(self._geometry_mode & G_FOG),
+            texture_gen=bool(self._geometry_mode & G_TEXTURE_GEN),
+            texture_gen_linear=bool(
+                self._geometry_mode & G_TEXTURE_GEN
+                and self._geometry_mode & G_TEXTURE_GEN_LINEAR
+            ),
+            hilite=self._hilite,
+            two_cycle=self._two_cycle,
+            mirror_s=tile.mirror_s if tile else False,
+            mirror_t=tile.mirror_t if tile else False,
+            mask_s=tile.mask_s if tile else 0,
+            mask_t=tile.mask_t if tile else 0,
+            shift_s=tile.shift_s if tile else 0,
+            shift_t=tile.shift_t if tile else 0,
+            other_mode_l=self._other_mode_l,
+        )
+
+    @property
+    def active_texture(self) -> _TextureKey | None:
+        if self._active_tile is None:
+            return None
+
+        descriptor = self._tile_descriptors.get(self._active_tile)
+        if descriptor is None:
+            return None
+
+        source = self._loaded_images.get(self._active_tile)
+        if source is None and self._last_loaded_tile is not None:
+            source = self._loaded_images.get(self._last_loaded_tile)
+        if source is None:
+            return None
+
+        tile_size = self._tile_size(self._active_tile)
+        loaded_size = self._loaded_tile_dimensions(descriptor)
+        if self._prefer_loaded_dimensions:
+            dimensions = loaded_size or tile_size
+        else:
+            dimensions = tile_size or loaded_size
+        if dimensions is None:
+            return None
+
+        palette_index = None
+        if descriptor.fmt == 2 and self._last_palette is not None:
+            palette_index = self._last_palette.index
+
+        return _TextureKey(
+            image_index=source.index,
+            palette_index=palette_index,
+            fmt=descriptor.fmt,
+            size=descriptor.size,
+            width=dimensions[0],
+            height=dimensions[1],
+            clamp_s=descriptor.clamp_s,
+            clamp_t=descriptor.clamp_t,
+        )
+
+    def _tile_size(self, tile: int) -> tuple[int, int] | None:
+        rect = self._tile_rects.get(tile)
+        if rect is None:
+            return None
+        return (
+            max(1, abs(rect.lrs - rect.uls) // 4 + 1),
+            max(1, abs(rect.lrt - rect.ult) // 4 + 1),
+        )
+
+    def _loaded_tile_dimensions(
+        self,
+        descriptor: _TileDescriptor,
+    ) -> tuple[int, int] | None:
+        byte_count = self._loaded_bytes.get(self._last_loaded_tile)
+        bits = 4 << descriptor.size
+        width = descriptor.line * (4 if descriptor.size == 3 else 64 // bits)
+        tile_size = self._tile_size(self._active_tile)
+        if width <= 0 and tile_size is not None:
+            width = tile_size[0]
+        if not byte_count or width <= 0:
+            return None
+
+        height = max(1, byte_count * 8 // (width * bits))
+        rect = self._tile_rects.get(self._active_tile)
+        if rect is not None and rect.lrt:
+            height = min(tile_size[1], height)
+        return width, height
+
+
+def _signed_16(value: int) -> int:
+    return value - 0x10000 if value & 0x8000 else value
+
+
+# Actor and prop model files (pointer tables 5 and 4) are relocatable blobs that reach their
+# vertices, display lists and textures through raw pointers and segment addresses.
+# ModelDecoder walks them like the RSP, tracking the vertex cache and bone matrix, and
+# produces the same mesh groups as map geometry.
+
+COMMAND_SIZE = 8
+BONE_RECORD_SIZE = 0x10
+MATRIX_SIZE = 0x40
+VERTEX_CACHE_SIZE = 32
+MAX_BRANCH_DEPTH = 64
+NO_PARENT = 0xFF
+BONE_MATRIX_SEGMENT = 0x04
+G_RM_FORCE_BL = 0x4000
+
+
+@dataclass(frozen=True, slots=True)
+class _CacheEntry:
+    offset: int
+    bone: int
+    scale_s: float
+    scale_t: float
+
+
+@dataclass
+class _MaterialMesh:
+    texture: _TextureKey | None
+    display_list_offset: int
+    translucent: bool = False
+    double_sided: bool = True
+    render: RenderState | None = None
+    optional_segment: int | None = None
+    vertices: list[Vertex] = field(default_factory=list)
+    vertex_bones: list[int] = field(default_factory=list)
+    vertex_normals: list[tuple[float, float, float]] = field(default_factory=list)
+    triangles: list[Triangle] = field(default_factory=list)
+    indices: dict[tuple, int] = field(default_factory=dict)
+
+
+def shift_scale(shift: int) -> float:
+    if shift == 0:
+        return 1.0
+    if shift <= 10:
+        return 1 / (1 << shift)
+    return float(1 << (16 - shift))
+
+
+def read_bones(
+    raw_data: bytes,
+    start: int,
+    count: int,
+) -> list[ModelBone]:
+    if start < 0 or start + count * BONE_RECORD_SIZE > len(raw_data):
+        raise ValueError("Bone table extends past the end of the file")
+
+    reader = BinaryReader(raw_data)
+    parents = list()
+    channels = list()
+    translations = list()
+    for bone_index in range(count):
+        offset = start + bone_index * BONE_RECORD_SIZE
+        parents.append(reader.read_u8(offset))
+        channels.append(reader.read_u8(offset + 2))
+        translations.append(
+            tuple(reader.read_f32(offset + 4 + axis * 4) for axis in range(3))
+        )
+
+    def world(bone_index: int) -> tuple[float, float, float]:
+        origin = [0.0, 0.0, 0.0]
+        visited = set()
+        while bone_index not in visited:
+            visited.add(bone_index)
+            for axis in range(3):
+                origin[axis] += translations[bone_index][axis]
+            parent = parents[bone_index]
+            if parent >= count:
+                break
+            bone_index = parent
+        return tuple(origin)
+
+    return [
+        ModelBone(
+            bone_index,
+            parents[bone_index],
+            translations[bone_index],
+            world(bone_index),
+            channels[bone_index],
+        )
+        for bone_index in range(count)
+    ]
+
+
+class ModelDecoder:
+    def __init__(
+        self,
+        raw_data: bytes,
+        resolve_address: Callable[[int], int | None],
+        bones: list[ModelBone] | None = None,
+        texture_segments: dict[int, int] | None = None,
+        fallback_textures: set[int] | None = None,
+    ):
+        self.raw_data = raw_data
+        self.resolve_address = resolve_address
+        self.bones = bones or list()
+        self.texture_segments = texture_segments or dict()
+        self.fallback_textures = fallback_textures or set()
+
+        self._cache: list[_CacheEntry | None] = [None] * VERTEX_CACHE_SIZE
+        self._visited: set[int] = set()
+        self._meshes: dict[tuple, _MaterialMesh] = dict()
+
+        self._bone = 0 if self.bones else NO_PARENT
+        self._state = _TextureState(prefer_loaded_dimensions=True)
+        self._display_list_offset = 0
+        self._optional_segment: int | None = None
+
+    @property
+    def mesh_groups(self) -> tuple[_MeshGroup, ...]:
+        return tuple(
+            _MeshGroup(
+                vertices=tuple(mesh.vertices),
+                triangles=tuple(mesh.triangles),
+                texture=mesh.texture,
+                display_list_offset=mesh.display_list_offset,
+                translucent=mesh.translucent,
+                double_sided=mesh.double_sided,
+                vertex_bones=tuple(mesh.vertex_bones),
+                vertex_normals=tuple(mesh.vertex_normals),
+                render=mesh.render,
+                optional_segment=mesh.optional_segment,
+            )
+            for mesh in self._meshes.values()
+        )
+
+    def walk(self, start: int | None, depth: int = 0) -> None:
+        if start is None or depth > MAX_BRANCH_DEPTH or start in self._visited:
+            return
+        if not 0 <= start < len(self.raw_data):
+            return
+        self._visited.add(start)
+        self._display_list_offset = start
+
+        position = start
+        while position + COMMAND_SIZE <= len(self.raw_data):
+            command = get_command(self.raw_data[position : position + COMMAND_SIZE])
+            position += COMMAND_SIZE
+            if command is None:
+                continue
+
+            if isinstance(command, commands.G_VTX):
+                self._load_vertices(command)
+            elif isinstance(command, commands.G_TRI1):
+                self._add_triangle(Triangle.from_tri1(command))
+            elif isinstance(command, commands.G_TRI2):
+                for triangle in Triangle.from_tri2(command):
+                    self._add_triangle(triangle)
+            elif isinstance(command, commands.G_QUAD):
+                self._add_triangle(Triangle(command.v1, command.v2, command.v3))
+                self._add_triangle(
+                    Triangle(command.v1_duplicate, command.v3_duplicate, command.v4)
+                )
+            elif isinstance(command, commands.G_MTX):
+                self._load_matrix(command)
+            elif isinstance(command, commands.G_DL):
+                self._state.apply(command)
+                target = self.resolve_address(
+                    int.from_bytes(command.segment + command.address, "big")
+                )
+                if target is not None:
+                    self.walk(target, depth + 1)
+                    if not command.store_return_address:
+                        return
+                elif not command.store_return_address:
+                    self._optional_segment = command.segment[0]
+                self._display_list_offset = start
+            elif isinstance(command, commands.G_SPNOOP):
+                if int.from_bytes(command.tag, "big") == self._optional_segment:
+                    self._optional_segment = None
+            elif isinstance(command, commands.G_ENDDL):
+                return
+            else:
+                self._state.apply(command)
+
+    def _load_matrix(self, command: commands.G_MTX) -> None:
+        segment, offset = command.address >> 24, command.address & 0xFFFFFF
+        if not self.bones or segment != BONE_MATRIX_SEGMENT:
+            return
+        if offset % MATRIX_SIZE == 0 and offset // MATRIX_SIZE < len(self.bones):
+            self._bone = offset // MATRIX_SIZE
+
+    def _load_vertices(self, command: commands.G_VTX) -> None:
+        first = command.buffer_start // 2
+        count = command.vertex_count
+        source = self.resolve_address(
+            int.from_bytes(command.segment + command.address, "big")
+        )
+        if source is None or source < 0 or first < 0 or first + count > VERTEX_CACHE_SIZE:
+            return
+        for cache_index in range(count):
+            offset = source + cache_index * VERTEX_SIZE
+            if offset + VERTEX_SIZE > len(self.raw_data):
+                break
+            self._cache[first + cache_index] = _CacheEntry(
+                offset,
+                self._bone,
+                *self._state.texture_scale,
+            )
+
+    def _add_triangle(self, triangle: Triangle) -> None:
+        corners = [
+            self._cache[index] if index < VERTEX_CACHE_SIZE else None
+            for index in (triangle.v1, triangle.v2, triangle.v3)
+        ]
+        if any(corner is None for corner in corners):
+            return
+
+        texture = self._active_texture()
+        geometry_mode = self._state.geometry_mode
+        translucent = bool(self._state.other_mode_l & G_RM_FORCE_BL)
+        double_sided = not geometry_mode & (G_CULL_FRONT | G_CULL_BACK)
+        lit = bool(geometry_mode & G_LIGHTING)
+        render = self._state.render_state
+        key = (
+            texture,
+            self._display_list_offset,
+            translucent,
+            double_sided,
+            lit,
+            render,
+            self._optional_segment,
+        )
+        mesh = self._meshes.get(key)
+        if mesh is None:
+            mesh = _MaterialMesh(
+                texture,
+                self._display_list_offset,
+                translucent,
+                double_sided,
+                render,
+                self._optional_segment,
+            )
+            self._meshes[key] = mesh
+
+        indices = [self._mesh_vertex(mesh, corner, texture) for corner in corners]
+        if len(set(indices)) == 3:
+            mesh.triangles.append(Triangle(*indices))
+
+    def _mesh_vertex(
+        self,
+        mesh: _MaterialMesh,
+        corner: _CacheEntry,
+        texture: _TextureKey | None,
+    ) -> int:
+        shading = self._state.geometry_mode & (G_LIGHTING | G_TEXTURE_GEN)
+        key = (corner, self._state.texture_tile, shading, texture)
+        index = mesh.indices.get(key)
+        if index is not None:
+            return index
+
+        index = len(mesh.vertices)
+        mesh.indices[key] = index
+        mesh.vertices.append(self._vertex(corner, texture))
+        mesh.vertex_bones.append(0 if corner.bone == NO_PARENT else corner.bone)
+        if self._state.geometry_mode & G_LIGHTING:
+            mesh.vertex_normals.append(self._normal(corner))
+        return index
+
+    def _normal(self, corner: _CacheEntry) -> tuple[float, float, float]:
+        axes = [
+            byte - 0x100 if byte > 0x7F else byte
+            for byte in self.raw_data[corner.offset + 12 : corner.offset + 15]
+        ]
+        length = math.sqrt(sum(axis * axis for axis in axes))
+        if length == 0:
+            return (0.0, 1.0, 0.0)
+        return tuple(axis / length for axis in axes)
+
+    def _vertex(self, corner: _CacheEntry, texture: _TextureKey | None) -> Vertex:
+        vertex = Vertex.from_bytes(
+            self.raw_data[corner.offset : corner.offset + VERTEX_SIZE]
+        )
+        origin = (0.0, 0.0, 0.0)
+        if corner.bone != NO_PARENT and corner.bone < len(self.bones):
+            origin = self.bones[corner.bone].world
+        geometry_mode = self._state.geometry_mode
+        if geometry_mode & G_TEXTURE_GEN and texture is not None:
+            normal = self._normal(corner)
+            texture_cord_u = round((0.5 + normal[0] / 2) * texture.width * 32)
+            texture_cord_v = round((0.5 - normal[1] / 2) * texture.height * 32)
+            white = True
+        else:
+            shift_s, shift_t = self._state.texture_tile_shift
+            uls, ult = self._state.texture_tile_origin
+            texture_cord_u = (
+                round(_signed_16(vertex.texture_cord_u) * corner.scale_s * shift_scale(shift_s))
+                - uls * 8
+            )
+            texture_cord_v = (
+                round(_signed_16(vertex.texture_cord_v) * corner.scale_t * shift_scale(shift_t))
+                - ult * 8
+            )
+            white = bool(geometry_mode & G_LIGHTING)
+        return replace(
+            vertex,
+            x=round(vertex.x + origin[0]),
+            y=round(vertex.y + origin[1]),
+            z=round(vertex.z + origin[2]),
+            texture_cord_u=_clamp_texel(texture_cord_u),
+            texture_cord_v=_clamp_texel(texture_cord_v),
+            xr=0xFF if white else vertex.xr,
+            yg=0xFF if white else vertex.yg,
+            zb=0xFF if white else vertex.zb,
+        )
+
+    def _active_texture(self) -> _TextureKey | None:
+        if not self._state.combiner_reads_texture:
+            return None
+        texture = self._state.active_texture
+        if texture is None:
+            return None
+
+        image_index = texture.image_index
+        if image_index >> 24:
+            image_index = self.texture_segments.get(image_index >> 24)
+            if image_index is None:
+                return None
+        elif image_index not in self.fallback_textures:
+            return texture
+
+        return replace(
+            texture,
+            image_index=image_index,
+            from_fallback_table=image_index in self.fallback_textures,
+        )
+
+
+def _clamp_texel(texel: int) -> int:
+    return max(-0x8000, min(0x7FFF, texel)) & 0xFFFF

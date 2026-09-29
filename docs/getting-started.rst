@@ -74,31 +74,31 @@ Blender-friendly textured geometry container.
 
 .. code-block:: python
 
-   rom.export_geometries("dk64_export/geometries")
+   rom.export_stages("dk64_export/stages")
 
 Use glTF when you want separate inspectable JSON, binary, and PNG files. Use OBJ
 when you need the legacy Wavefront output:
 
 .. code-block:: python
 
-   rom.export_geometries("dk64_export/geometries", geometry_format="gltf")
-   rom.export_geometries("dk64_export/geometries", geometry_format="obj")
+   rom.export_stages("dk64_export/stages", geometry_format="gltf")
+   rom.export_stages("dk64_export/stages", geometry_format="obj")
 
 COLLADA export remains available for tools that still accept DAE:
 
 .. code-block:: python
 
-   rom.export_geometries("dk64_export/geometries", geometry_format="dae")
+   rom.export_stages("dk64_export/stages", geometry_format="dae")
 
 Export a single geometry table entry:
 
 .. code-block:: python
 
-   geometry = rom.geometry_tables[0]
-   geometry.save_to_obj("map_000.obj", "dk64_export/geometries")
-   geometry.save_to_glb("map_000.glb", "dk64_export/geometries")
-   geometry.save_to_gltf("map_000.gltf", "dk64_export/geometries")
-   geometry.save_to_dae("map_000.dae", "dk64_export/geometries")
+   geometry = rom.stage_geometry_tables[0]
+   geometry.save_to_obj("map_000.obj", "dk64_export/stages")
+   geometry.save_to_glb("map_000.glb", "dk64_export/stages")
+   geometry.save_to_gltf("map_000.gltf", "dk64_export/stages")
+   geometry.save_to_dae("map_000.dae", "dk64_export/stages")
 
 By default, OBJ export writes RGB vertex colors, UV coordinates for textured
 mesh groups, MTL materials, and decoded PNG textures. GLB and glTF write RGBA

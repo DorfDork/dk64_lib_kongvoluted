@@ -51,23 +51,24 @@ class RomTest(unittest.TestCase):
     def test_geometry_texture_data_uses_geometry_texture_table(self):
         texture_data = self.rom.get_geometry_texture_data()
 
-        self.assertEqual(len(texture_data), 6011)
+        self.assertEqual(len(texture_data), 6013)
+        self.assertEqual(sum(1 for texture in texture_data if texture is None), 2)
         self.assertEqual(texture_data[0].offset, 18429500)
 
     def test_geometry_data(self):
-        self.assertEqual(len(self.rom.geometry_tables), 216)
+        self.assertEqual(len(self.rom.stage_geometry_tables), 216)
 
-        geometry_table = self.rom.geometry_tables[0]
+        geometry_table = self.rom.stage_geometry_tables[0]
         self.assertEqual(geometry_table.offset, 1386148)
         self.assertEqual(geometry_table.size, 930)
         self.assertEqual(len(geometry_table.display_lists), 2)
 
-        geometry_table = self.rom.geometry_tables[20]
+        geometry_table = self.rom.stage_geometry_tables[20]
         self.assertEqual(geometry_table.offset, 1988678)
         self.assertEqual(geometry_table.size, 31532)
         self.assertEqual(len(geometry_table.display_lists), 33)
 
-        geometry_table = self.rom.geometry_tables[-1]
+        geometry_table = self.rom.stage_geometry_tables[-1]
         self.assertEqual(geometry_table.offset, 4443108)
         self.assertEqual(geometry_table.size, 8)
         self.assertEqual(len(geometry_table.display_lists), 0)
@@ -103,7 +104,7 @@ class RomTest(unittest.TestCase):
         self.assertEqual(first_pass[-1]["offset"], second_pass[-1]["offset"])
 
     def test_geometry_dae_export(self):
-        geometry_table = self.rom.geometry_tables[0]
+        geometry_table = self.rom.stage_geometry_tables[0]
         dae = geometry_table.create_dae(include_textures=False)
 
         self.assertEqual(len(dae.geometries), 1)
@@ -116,7 +117,7 @@ class RomTest(unittest.TestCase):
             self.assertGreater(dae_path.stat().st_size, 0)
 
     def test_geometry_textured_dae_export(self):
-        geometry_table = self.rom.geometry_tables[0]
+        geometry_table = self.rom.stage_geometry_tables[0]
         export = geometry_table.create_textured_dae()
 
         self.assertGreater(len(export.dae.geometries), 0)
@@ -134,27 +135,24 @@ class RomTest(unittest.TestCase):
             self.assertTrue(texture_paths[0].exists())
 
     def test_geometry_gltf_export(self):
-        geometry_table = self.rom.geometry_tables[0]
-        export = geometry_table.create_textured_gltf(binary_filename="0.bin")
+        geometry_table = self.rom.stage_geometry_tables[0]
+        export = geometry_table.create_textured_gltf()
         gltf = json.loads(export.gltf_data)
 
         self.assertGreater(len(gltf["meshes"]), 0)
-        self.assertGreater(len(export.binary_data), 0)
-        self.assertGreater(len(export.images), 0)
+        self.assertGreater(len(gltf["images"]), 0)
+        self.assertTrue(gltf["buffers"][0]["uri"].startswith("data:"))
 
         with TemporaryDirectory() as temp_dir:
             written_paths = geometry_table.save_to_gltf("0.gltf", temp_dir)
             gltf_path = Path(temp_dir) / "0.gltf"
-            bin_path = Path(temp_dir) / "0.bin"
-            texture_paths = [path for path in written_paths if path.suffix == ".png"]
-            self.assertEqual(written_paths[0], gltf_path)
-            self.assertEqual(written_paths[1], bin_path)
-            self.assertTrue(gltf_path.exists())
-            self.assertTrue(bin_path.exists())
-            self.assertGreater(len(texture_paths), 0)
+
+            self.assertEqual(written_paths, [gltf_path])
+            self.assertEqual([path.name for path in Path(temp_dir).iterdir()], ["0.gltf"])
+            self.assertGreater(gltf_path.stat().st_size, 0)
 
     def test_geometry_glb_export(self):
-        geometry_table = self.rom.geometry_tables[0]
+        geometry_table = self.rom.stage_geometry_tables[0]
         export = geometry_table.create_textured_glb()
 
         self.assertTrue(export.data.startswith(b"glTF"))
